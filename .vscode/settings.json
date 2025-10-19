@@ -1,0 +1,49 @@
+{
+    "cSpell.words": [
+        "backtrace",
+        "cpuid",
+        "ECALL",
+        "ehdr",
+        "ENOMEM",
+        "FELF",
+        "hartid",
+        "HTIF",
+        "mcause",
+        "mepc",
+        "mscause",
+        "MTIMECMP",
+        "MTIMER",
+        "mtrap",
+        "mtval",
+        "NOTELF",
+        "printu",
+        "regs",
+        "riscv",
+        "scause",
+        "sepc",
+        "smode",
+        "SSIP",
+        "ssize",
+        "sstatus",
+        "stval",
+        "syscall",
+        "syscalls",
+        "trapframe",
+        "usertrap"
+    ],
+    "cSpell.ignorePaths": [
+        "**/node_modules/**",
+        "**/build/**",
+        "**/dist/**",
+        "**/.git/**"
+    ],
+    "cSpell.enabledLanguageIds": [
+        "markdown",
+        "c",
+        "cpp",
+        "h",
+        "hpp",
+        "assembly",
+        "riscv"
+    ]
+}
