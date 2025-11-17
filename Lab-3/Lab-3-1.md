@@ -972,14 +972,6 @@ void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
 - 用以下代码替换`process.c`
 
 ```c
-/*
- * Utility functions for process management. 
- *
- * Note: in Lab1, only one process (i.e., our user application) exists. Therefore, 
- * PKE OS at this stage will set "current" to the loaded user application, and also
- * switch to the old "current" process after trap handling.
- */
-
 #include "riscv.h"
 #include "strap.h"
 #include "config.h"
