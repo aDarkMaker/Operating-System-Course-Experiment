@@ -1610,6 +1610,16 @@ void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
   stack_region->npages += 1;
 }
 
+void rrsched() {
+  current->tick_count++;
+  if (current->tick_count >= TIME_SLICE_LEN) {
+    current->tick_count = 0;
+    current->status = READY;
+    insert_to_ready_queue(current);
+    schedule();
+  }
+}
+
 void smode_trap_handler(void) {
   if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
 
@@ -1624,6 +1634,7 @@ void smode_trap_handler(void) {
       break;
     case CAUSE_MTIMER_S_TRAP:
       handle_mtimer_trap();
+      rrsched();
       break;
     case CAUSE_STORE_PAGE_FAULT:
     case CAUSE_LOAD_PAGE_FAULT:
@@ -1939,6 +1950,8 @@ process* alloc_process() {
 
   procs[i].total_mapped_region = 4;
 
+  procs[i].pfiles = init_proc_file_management();
+
   return &procs[i];
 }
 
@@ -1991,7 +2004,6 @@ int do_fork( process* parent)
         for (uint64 page = 0; page < code_pages; page++) {
           uint64 va = code_base + page * PGSIZE;
           uint64 pa = lookup_pa(parent->pagetable, va);
-          if (pa == 0) panic("invalid code segment mapping.\n");
           user_vm_map((pagetable_t)child->pagetable, va, PGSIZE, pa,
             prot_to_type(PROT_READ | PROT_EXEC, 1));
         }
@@ -2014,13 +2026,596 @@ int do_fork( process* parent)
 }
 ```
 
-# 通关操作补充说明
-
-- 在`rfs.c`的`rfs_create`函数中，将第1429行的panic替换为以下代码：
+- 用以下代码替换`syscall.c`
 
 ```c
+#include <stdint.h>
+#include <errno.h>
+
+#include "util/types.h"
+#include "syscall.h"
+#include "string.h"
+#include "process.h"
+#include "util/functions.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "sched.h"
+#include "proc_file.h"
+
+#include "spike_interface/spike_utils.h"
+
+ssize_t sys_user_print(const char* buf, size_t n) {
+  assert( current );
+  char* pa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), (void*)buf);
+  sprint(pa);
+  return 0;
+}
+
+ssize_t sys_user_exit(uint64 code) {
+  sprint("User exit with code:%d.\n", code);
+  free_process( current );
+  schedule();
+  return 0;
+}
+
+uint64 sys_user_allocate_page() {
+  void* pa = alloc_page();
+  uint64 va;
+  if (current->user_heap.free_pages_count > 0) {
+    va =  current->user_heap.free_pages_address[--current->user_heap.free_pages_count];
+  } else {
+    va = current->user_heap.heap_top;
+    current->user_heap.heap_top += PGSIZE;
+    current->mapped_info[HEAP_SEGMENT].npages++;
+  }
+  user_vm_map((pagetable_t)current->pagetable, va, PGSIZE, (uint64)pa,
+         prot_to_type(PROT_WRITE | PROT_READ, 1));
+
+  return va;
+}
+
+uint64 sys_user_free_page(uint64 va) {
+  user_vm_unmap((pagetable_t)current->pagetable, va, PGSIZE, 1);
+  current->user_heap.free_pages_address[current->user_heap.free_pages_count++] = va;
+  return 0;
+}
+
+ssize_t sys_user_fork() {
+  return do_fork( current );
+}
+
+ssize_t sys_user_yield() {
+  current->status = READY;
+  insert_to_ready_queue(current);
+  schedule();
+  return 0;
+}
+
+ssize_t sys_user_open(char *pathva, int flags) {
+  char* pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
+  return do_open(pathpa, flags);
+}
+
+ssize_t sys_user_read(int fd, char *bufva, uint64 count) {
+  int i = 0;
+  while (i < count) {
+    uint64 addr = (uint64)bufva + i;
+    uint64 pa = lookup_pa((pagetable_t)current->pagetable, addr);
+    uint64 off = addr - ROUNDDOWN(addr, PGSIZE);
+    uint64 len = count - i < PGSIZE - off ? count - i : PGSIZE - off;
+    uint64 r = do_read(fd, (char *)pa + off, len);
+    i += r; if (r < len) return i;
+  }
+  return count;
+}
+
+ssize_t sys_user_write(int fd, char *bufva, uint64 count) {
+  int i = 0;
+  while (i < count) {
+    uint64 addr = (uint64)bufva + i;
+    uint64 pa = lookup_pa((pagetable_t)current->pagetable, addr);
+    uint64 off = addr - ROUNDDOWN(addr, PGSIZE);
+    uint64 len = count - i < PGSIZE - off ? count - i : PGSIZE - off;
+    uint64 r = do_write(fd, (char *)pa + off, len);
+    i += r; if (r < len) return i;
+  }
+  return count;
+}
+
+ssize_t sys_user_lseek(int fd, int offset, int whence) {
+  return do_lseek(fd, offset, whence);
+}
+
+ssize_t sys_user_stat(int fd, struct istat *istat) {
+  struct istat * pistat = (struct istat *)user_va_to_pa((pagetable_t)(current->pagetable), istat);
+  return do_stat(fd, pistat);
+}
+
+ssize_t sys_user_disk_stat(int fd, struct istat *istat) {
+  struct istat * pistat = (struct istat *)user_va_to_pa((pagetable_t)(current->pagetable), istat);
+  return do_disk_stat(fd, pistat);
+}
+
+ssize_t sys_user_close(int fd) {
+  return do_close(fd);
+}
+
+long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
+  switch (a0) {
+    case SYS_user_print:
+      return sys_user_print((const char*)a1, a2);
+    case SYS_user_exit:
+      return sys_user_exit(a1);
+    case SYS_user_allocate_page:
+      return sys_user_allocate_page();
+    case SYS_user_free_page:
+      return sys_user_free_page(a1);
+    case SYS_user_fork:
+      return sys_user_fork();
+    case SYS_user_yield:
+      return sys_user_yield();
+    case SYS_user_open:
+      return sys_user_open((char *)a1, a2);
+    case SYS_user_read:
+      return sys_user_read(a1, (char *)a2, a3);
+    case SYS_user_write:
+      return sys_user_write(a1, (char *)a2, a3);
+    case SYS_user_lseek:
+      return sys_user_lseek(a1, a2, a3);
+    case SYS_user_stat:
+      return sys_user_stat(a1, (struct istat *)a2);
+    case SYS_user_disk_stat:
+      return sys_user_disk_stat(a1, (struct istat *)a2);
+    case SYS_user_close:
+      return sys_user_close(a1);
+    default:
+      panic("Unknown syscall %ld \n", a0);
+  }
+}
+```
+
+- 用以下代码替换`rfs.c`
+
+```c
+#include "rfs.h"
+
+#include "pmm.h"
+#include "ramdev.h"
+#include "spike_interface/spike_utils.h"
+#include "util/string.h"
+#include "vfs.h"
+
+const struct vinode_ops rfs_i_ops = {
+    .viop_read = rfs_read,
+    .viop_write = rfs_write,
+    .viop_create = rfs_create,
+    .viop_lseek = rfs_lseek,
+    .viop_disk_stat = rfs_disk_stat,
+    .viop_lookup = rfs_lookup,
+
+    .viop_write_back_vinode = rfs_write_back_vinode,
+};
+
+int register_rfs() {
+  struct file_system_type *fs_type = (struct file_system_type *)alloc_page();
+  fs_type->type_num = RFS_TYPE;
+  fs_type->get_superblock = rfs_get_superblock;
+
+  for (int i = 0; i < MAX_SUPPORTED_FS; i++) {
+    if (fs_list[i] == NULL) {
+      fs_list[i] = fs_type;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int rfs_format_dev(struct device *dev) {
+  struct rfs_device *rdev = rfs_device_list[dev->dev_id];
+
+  struct super_block *super = (struct super_block *)rdev->iobuffer;
+  super->magic = RFS_MAGIC;
+  super->size =
+      1 + RFS_MAX_INODE_BLKNUM + 1 + RFS_MAX_INODE_BLKNUM * RFS_DIRECT_BLKNUM;
+  super->nblocks = RFS_MAX_INODE_BLKNUM * RFS_DIRECT_BLKNUM;
+  super->ninodes = RFS_BLKSIZE / RFS_INODESIZE * RFS_MAX_INODE_BLKNUM;
+
+  if (rfs_w1block(rdev, RFS_BLK_OFFSET_SUPER) != 0)
+    panic("RFS: failed to write superblock!\n");
+
+  struct rfs_dinode *p_dinode = (struct rfs_dinode *)rdev->iobuffer;
+  for (int i = 0; i < RFS_BLKSIZE / RFS_INODESIZE; ++i) {
+    p_dinode->size = 0;
+    p_dinode->type = R_FREE;
+    p_dinode->nlinks = 0;
+    p_dinode->blocks = 0;
+    p_dinode = (struct rfs_dinode *)((char *)p_dinode + RFS_INODESIZE);
+  }
+
+  for (int inode_block = 0; inode_block < RFS_MAX_INODE_BLKNUM; ++inode_block) {
+    if (rfs_w1block(rdev, RFS_BLK_OFFSET_INODE + inode_block) != 0)
+      panic("RFS: failed to initialize empty inodes!\n");
+  }
+
+  struct rfs_dinode root_dinode;
+  root_dinode.size = 0;
+  root_dinode.type = R_DIR;
+  root_dinode.nlinks = 1;
+  root_dinode.blocks = 1;
+  root_dinode.addrs[0] = RFS_BLK_OFFSET_FREE;
+
+  if (rfs_write_dinode(rdev, &root_dinode, 0) != 0) {
+    sprint("RFS: failed to write root inode!\n");
+    return -1;
+  }
+
+  int *freemap = (int *)rdev->iobuffer;
+  memset(freemap, 0, RFS_BLKSIZE);
+  freemap[0] = 1;
+
+  if (rfs_w1block(rdev, RFS_BLK_OFFSET_BITMAP) != 0) {
+    sprint("RFS: failed to write bitmap!\n");
+    return -1;
+  }
+
+  sprint("RFS: format %s done!\n", dev->dev_name);
+  return 0;
+}
+
+int rfs_r1block(struct rfs_device *rfs_dev, int n_block) {
+  return dop_read(rfs_dev, n_block);
+}
+
+int rfs_w1block(struct rfs_device *rfs_dev, int n_block) {
+  return dop_write(rfs_dev, n_block);
+}
+
+struct rfs_dinode *rfs_read_dinode(struct rfs_device *rdev, int n_inode) {
+  int n_block = n_inode / (RFS_BLKSIZE / RFS_INODESIZE) + RFS_BLK_OFFSET_INODE;
+  int offset = n_inode % (RFS_BLKSIZE / RFS_INODESIZE);
+
+  if (dop_read(rdev, n_block) != 0) return NULL;
+  struct rfs_dinode *dinode = (struct rfs_dinode *)alloc_page();
+  memcpy(dinode, (char *)rdev->iobuffer + offset * RFS_INODESIZE,
+         sizeof(struct rfs_dinode));
+  return dinode;
+}
+
+int rfs_write_dinode(struct rfs_device *rdev, const struct rfs_dinode *dinode,
+                     int n_inode) {
+  int n_block = n_inode / (RFS_BLKSIZE / RFS_INODESIZE) + RFS_BLK_OFFSET_INODE;
+  int offset = n_inode % (RFS_BLKSIZE / RFS_INODESIZE);
+
+  dop_read(rdev, n_block);
+  memcpy(rdev->iobuffer + offset * RFS_INODESIZE, dinode,
+         sizeof(struct rfs_dinode));
+  int ret = dop_write(rdev, n_block);
+
+  return ret;
+}
+
+int rfs_alloc_block(struct super_block *sb) {
+  int free_block = -1;
+  int *freemap = (int *)sb->s_fs_info;
+  for (int block = 0; block < sb->nblocks; ++block) {
+    if (freemap[block] == 0) {
+      freemap[block] = 1;
+      free_block = RFS_BLK_OFFSET_FREE + block;
+      break;
+    }
+  }
+  if (free_block == -1) panic("rfs_alloc_block: no more free block!\n");
+  return free_block;
+}
+
+int rfs_free_block(struct super_block *sb, int block_num) {
+  int *freemap = (int *)sb->s_fs_info;
+  freemap[block_num - RFS_BLK_OFFSET_FREE] = 0;
+  return 0;
+}
+
+int rfs_add_direntry(struct vinode *dir, const char *name, int inum) {
+  struct rfs_device *rdev = rfs_device_list[dir->sb->s_dev->dev_id];
+  int n_block = dir->addrs[dir->size / RFS_BLKSIZE];
+  if (rfs_r1block(rdev, n_block) != 0) {
+    return -1;
+  }
+
+  char *addr = (char *)rdev->iobuffer + dir->size % RFS_BLKSIZE;
+  struct rfs_direntry *p_direntry = (struct rfs_direntry *)addr;
+  p_direntry->inum = inum;
+  strcpy(p_direntry->name, name);
+
+  if (rfs_w1block(rdev, n_block) != 0) {
+    return -1;
+  }
+
+  dir->size += sizeof(struct rfs_direntry);
+
+  if (rfs_write_back_vinode(dir) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+struct vinode *rfs_alloc_vinode(struct super_block *sb) {
+  struct vinode *vinode = default_alloc_vinode(sb);
+  vinode->i_ops = &rfs_i_ops;
+  return vinode;
+}
+
+int rfs_write_back_vinode(struct vinode *vinode) {
+  struct rfs_dinode dinode;
+  dinode.size = vinode->size;
+  dinode.nlinks = vinode->nlinks;
+  dinode.blocks = vinode->blocks;
+  dinode.type = vinode->type;
+  for (int i = 0; i < RFS_DIRECT_BLKNUM; ++i) {
+    dinode.addrs[i] = vinode->addrs[i];
+  }
+
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  if (rfs_write_dinode(rdev, &dinode, vinode->inum) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int rfs_update_vinode(struct vinode *vinode) {
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  struct rfs_dinode *dinode = rfs_read_dinode(rdev, vinode->inum);
+  if (dinode == NULL) {
+    return -1;
+  }
+  vinode->size = dinode->size;
+  vinode->nlinks = dinode->nlinks;
+  vinode->blocks = dinode->blocks;
+  vinode->type = dinode->type;
+  for (int i = 0; i < RFS_DIRECT_BLKNUM; ++i) {
+    vinode->addrs[i] = dinode->addrs[i];
+  }
+  free_page(dinode);
+
+  return 0;
+}
+
+ssize_t rfs_read(struct vinode *f_inode, char *r_buf, ssize_t len,
+                 int *offset) {
+  if (f_inode->size < (*offset + len)) len = f_inode->size - *offset;
+
+  char buffer[len + 1];
+
+  int align = *offset % RFS_BLKSIZE;
+  int block_offset = *offset / RFS_BLKSIZE;
+  int buf_offset = 0;
+
+  int readtimes = (align + len) / RFS_BLKSIZE;
+  int remain = (align + len) % RFS_BLKSIZE;
+
+  struct rfs_device *rdev = rfs_device_list[f_inode->sb->s_dev->dev_id];
+
+  rfs_r1block(rdev, f_inode->addrs[block_offset]);
+  int first_block_len = (readtimes == 0 ? len : RFS_BLKSIZE - align);
+  memcpy(buffer + buf_offset, rdev->iobuffer + align, first_block_len);
+  buf_offset += first_block_len;
+  block_offset++;
+  readtimes--;
+
+  if (readtimes >= 0) {
+    while (readtimes != 0) {
+      rfs_r1block(rdev, f_inode->addrs[block_offset]);
+      memcpy(buffer + buf_offset, rdev->iobuffer, RFS_BLKSIZE);
+      buf_offset += RFS_BLKSIZE;
+      block_offset++;
+      readtimes--;
+    }
+
+    if (remain > 0) {
+      rfs_r1block(rdev, f_inode->addrs[block_offset]);
+      memcpy(buffer + buf_offset, rdev->iobuffer, remain);
+    }
+  }
+
+  buffer[len] = '\0';
+  strcpy(r_buf, buffer);
+
+  *offset += len;
+  return len;
+}
+
+ssize_t rfs_write(struct vinode *f_inode, const char *w_buf, ssize_t len,
+                  int *offset) {
+  int align = *offset % RFS_BLKSIZE;
+  int writetimes = (len + align) / RFS_BLKSIZE;
+  int remain = (len + align) % RFS_BLKSIZE;
+
+  int buf_offset = 0;
+  int block_offset = *offset / RFS_BLKSIZE;
+
+  struct rfs_device *rdev = rfs_device_list[f_inode->sb->s_dev->dev_id];
+
+  if (align != 0) {
+    rfs_r1block(rdev, f_inode->addrs[block_offset]);
+    int first_block_len = (writetimes == 0 ? len : RFS_BLKSIZE - align);
+    memcpy(rdev->iobuffer + align, w_buf, first_block_len);
+    rfs_w1block(rdev, f_inode->addrs[block_offset]);
+
+    buf_offset += first_block_len;
+    block_offset++;
+    writetimes--;
+  }
+
+  if (writetimes >= 0) {
+    while (writetimes != 0) {
+      if (block_offset == f_inode->blocks) {
+        f_inode->addrs[block_offset] = rfs_alloc_block(f_inode->sb);
+        f_inode->blocks++;
+      }
+
+      memcpy(rdev->iobuffer, w_buf + buf_offset, RFS_BLKSIZE);
+      rfs_w1block(rdev, f_inode->addrs[block_offset]);
+
+      buf_offset += RFS_BLKSIZE;
+      block_offset++;
+      writetimes--;
+    }
+
+    if (remain > 0) {
+      if (block_offset == f_inode->blocks) {
+        f_inode->addrs[block_offset] = rfs_alloc_block(f_inode->sb);
+        ++f_inode->blocks;
+      }
+      memcpy(rdev->iobuffer, w_buf + buf_offset, remain);
+      rfs_w1block(rdev, f_inode->addrs[block_offset]);
+    }
+  }
+
+  f_inode->size =
+      (f_inode->size < *offset + len ? *offset + len : f_inode->size);
+
+  *offset += len;
+  return len;
+}
+
+struct vinode *rfs_lookup(struct vinode *parent, struct dentry *sub_dentry) {
+  struct rfs_direntry *p_direntry = NULL;
+  struct vinode *child_vinode = NULL;
+
+  int total_direntrys = parent->size / sizeof(struct rfs_direntry);
+  int one_block_direntrys = RFS_BLKSIZE / sizeof(struct rfs_direntry);
+
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  for (int i = 0; i < total_direntrys; ++i) {
+    if (i % one_block_direntrys == 0) {
+      rfs_r1block(rdev, parent->addrs[i / one_block_direntrys]);
+      p_direntry = (struct rfs_direntry *)rdev->iobuffer;
+    }
+    if (strcmp(p_direntry->name, sub_dentry->name) == 0) {
+      child_vinode = rfs_alloc_vinode(parent->sb);
+      child_vinode->inum = p_direntry->inum;
+      rfs_update_vinode(child_vinode);
+      break;
+    }
+    ++p_direntry;
+  }
+  return child_vinode;
+}
+
+struct vinode *rfs_create(struct vinode *parent, struct dentry *sub_dentry) {
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  struct rfs_dinode *free_dinode = NULL;
+  int free_inum = 0;
+  for (int i = 0; i < (RFS_BLKSIZE / RFS_INODESIZE * RFS_MAX_INODE_BLKNUM);
+       ++i) {
+    free_dinode = rfs_read_dinode(rdev, i);
+    if (free_dinode->type == R_FREE) {
+      free_inum = i;
+      break;
+    }
+    free_page(free_dinode);
+  }
+
+  if (free_dinode == NULL)
+    panic("rfs_create: no more free disk inode, we cannot create file.\n" );
+
   free_dinode->size = 0;
   free_dinode->type = R_FILE;
   free_dinode->nlinks = 1;
   free_dinode->blocks = 0;
+
+  free_dinode->addrs[0] = rfs_alloc_block(parent->sb);
+
+  rfs_write_dinode(rdev, free_dinode, free_inum);
+  free_page(free_dinode);
+
+  struct vinode *new_vinode = rfs_alloc_vinode(parent->sb);
+  new_vinode->inum = free_inum;
+  rfs_update_vinode(new_vinode);
+
+  int result = rfs_add_direntry(parent, sub_dentry->name, free_inum);
+  if (result == -1) {
+    return NULL;
+  }
+
+  return new_vinode;
+}
+
+int rfs_lseek(struct vinode *f_inode, ssize_t new_offset, int whence, int *offset) {
+  int file_size = f_inode->size;
+
+  switch (whence) {
+    case LSEEK_SET:
+      if (new_offset < 0 || new_offset > file_size) {
+        return -1;
+      }
+      *offset = new_offset;
+      break;
+    case LSEEK_CUR:
+      if (*offset + new_offset < 0 || *offset + new_offset > file_size) {
+        return -1;
+      }
+      *offset += new_offset;
+      break;
+    default:
+      return -1;
+  }
+  
+  return 0;
+}
+
+int rfs_disk_stat(struct vinode *vinode, struct istat *istat) {
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  struct rfs_dinode *dinode = rfs_read_dinode(rdev, vinode->inum);
+  if (dinode == NULL) {
+    return -1;
+  }
+
+  istat->st_inum = vinode->inum;
+  istat->st_size = dinode->size;
+  istat->st_type = dinode->type;
+  istat->st_nlinks = dinode->nlinks;
+  istat->st_blocks = dinode->blocks;
+  free_page(dinode);
+  return 0;
+}
+
+struct super_block *rfs_get_superblock(struct device *dev) {
+  struct rfs_device *rdev = rfs_device_list[dev->dev_id];
+
+  if (rfs_r1block(rdev, RFS_BLK_OFFSET_SUPER) != 0)
+    panic("RFS: failed to read superblock!\n");
+
+  struct rfs_superblock d_sb;
+  memcpy(&d_sb, rdev->iobuffer, sizeof(struct rfs_superblock));
+
+  struct super_block *sb = alloc_page();
+  sb->magic = d_sb.magic;
+  sb->size = d_sb.size;
+  sb->nblocks = d_sb.nblocks;
+  sb->ninodes = d_sb.ninodes;
+  sb->s_dev = dev;
+
+  if( sb->magic != RFS_MAGIC ) 
+    panic("rfs_get_superblock: wrong ramdisk device!\n");
+
+  struct vinode *root_inode = rfs_alloc_vinode(sb);
+  root_inode->inum = 0;
+  rfs_update_vinode(root_inode);
+
+  struct dentry *root_dentry = alloc_vfs_dentry("/", root_inode, NULL);
+  sb->s_root = root_dentry;
+
+  if (rfs_r1block(rdev, RFS_BLK_OFFSET_BITMAP) != 0)
+    panic("RFS: failed to read bitmap!\n");
+  void *bitmap = alloc_page();
+  memcpy(bitmap, rdev->iobuffer, RFS_BLKSIZE);
+  sb->s_fs_info = bitmap;
+
+  return sb;
+}
 ```
+
