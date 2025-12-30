@@ -1225,15 +1225,16 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
 #include "util/snprintf.h"
 #include "kernel/syscall.h"
 
-int do_user_call(uint64 sysnum, uint64 a1, uint64 a2, uint64 a3, uint64 a4, uint64 a5, uint64 a6, uint64 a7) {
-    int ret;
+int do_user_call(uint64 sysnum, uint64 a1, uint64 a2, uint64 a3, uint64 a4, uint64 a5, uint64 a6,
+                 uint64 a7) {
+  int ret;
 
-    asm volatile(
-        "ecall\n"
-        "sw a0, %0"
-        : "=m"(ret)
-        :
-        : "memory");
+  asm volatile(
+      "ecall\n"
+      "sw a0, %0"
+      : "=m"(ret)
+      :
+      : "memory");
 
   return ret;
 }
@@ -1277,37 +1278,37 @@ int print_backtrace();
 #include "spike_interface/spike_utils.h"
 
 static void handle_syscall(trapframe *tf) {
-    tf->epc += 4;
-    tf->regs.a0 = do_syscall(tf->regs.a0, tf->regs.a1, tf->regs.a2, tf->regs.a3, tf->regs.a4, tf->regs.a5, tf->regs.a6, tf->regs.a7);
+  tf->epc += 4;
+  tf->regs.a0 = do_syscall(tf->regs.a0, tf->regs.a1, tf->regs.a2, tf->regs.a3, tf->regs.a4, tf->regs.a5, tf->regs.a6, tf->regs.a7);
 }
 
 static uint64 g_ticks = 0;
 
 void handle_mtimer_trap() {
-    sprint("Ticks %d\n", g_ticks);
-    g_ticks++;
-    write_csr(sip, read_csr(sip) & ~SIP_SSIP);
+  sprint("Ticks %d\n", g_ticks);
+  g_ticks++;
+  write_csr(sip, read_csr(sip) & ~SIP_SSIP);
 }
 
 void smode_trap_handler(void) {
-    if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
+  if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
 
-    assert(current);
-    current->trapframe->epc = read_csr(sepc);
+  assert(current);
+  current->trapframe->epc = read_csr(sepc);
 
-    uint64 cause = read_csr(scause);
+  uint64 cause = read_csr(scause);
 
-    if (cause == CAUSE_USER_ECALL) {
-        handle_syscall(current->trapframe);
-    } else if (cause == CAUSE_MTIMER_S_TRAP) {
-        handle_mtimer_trap();
-    } else {
-        sprint("smode_trap_handler(): unexpected scause %p\n", read_csr(scause));
-        sprint("            sepc=%p stval=%p\n", read_csr(sepc), read_csr(stval));
-        panic( "unexpected exception happened.\n" );
-    }
+  if (cause == CAUSE_USER_ECALL) {
+    handle_syscall(current->trapframe);
+  } else if (cause == CAUSE_MTIMER_S_TRAP) {
+    handle_mtimer_trap();
+  } else {
+    sprint("smode_trap_handler(): unexpected scause %p\n", read_csr(scause));
+    sprint("            sepc=%p stval=%p\n", read_csr(sepc), read_csr(stval));
+    panic( "unexpected exception happened.\n" );
+  }
 
-    switch_to(current);
+  switch_to(current);
 }
 ```
 
@@ -1330,41 +1331,41 @@ static void handle_misaligned_load() { panic("Misaligned Load!"); }
 static void handle_misaligned_store() { panic("Misaligned AMO!"); }
 
 static void handle_timer() {
-    int cpuid = 0;
-    *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
-    write_csr(sip, SIP_SSIP);
+  int cpuid = 0;
+  *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
+  write_csr(sip, SIP_SSIP);
 }
 
 void handle_mtrap() {
-    uint64 mcause = read_csr(mcause);
-    switch (mcause) {
-        case CAUSE_MTIMER:
-            handle_timer();
-            break;
-        case CAUSE_FETCH_ACCESS:
-            handle_instruction_access_fault();
-            break;
-        case CAUSE_LOAD_ACCESS:
-            handle_load_access_fault();
-        case CAUSE_STORE_ACCESS:
-            handle_store_access_fault();
-            break;
-        case CAUSE_ILLEGAL_INSTRUCTION:
-            handle_illegal_instruction();
-            break;
-        case CAUSE_MISALIGNED_LOAD:
-            handle_misaligned_load();
-            break;
-        case CAUSE_MISALIGNED_STORE:
-            handle_misaligned_store();
-            break;
+  uint64 mcause = read_csr(mcause);
+  switch (mcause) {
+    case CAUSE_MTIMER:
+      handle_timer();
+      break;
+    case CAUSE_FETCH_ACCESS:
+      handle_instruction_access_fault();
+      break;
+    case CAUSE_LOAD_ACCESS:
+      handle_load_access_fault();
+    case CAUSE_STORE_ACCESS:
+      handle_store_access_fault();
+      break;
+    case CAUSE_ILLEGAL_INSTRUCTION:
+      handle_illegal_instruction();
+      break;
+    case CAUSE_MISALIGNED_LOAD:
+      handle_misaligned_load();
+      break;
+    case CAUSE_MISALIGNED_STORE:
+      handle_misaligned_store();
+      break;
 
-        default:
-            sprint("machine trap(): unexpected mscause %p\n", mcause);
-            sprint("            mepc=%p mtval=%p\n", read_csr(mepc), read_csr(mtval));
-            panic( "unexpected exception happened in M-mode.\n" );
-            break;
-    }
+    default:
+      sprint("machine trap(): unexpected mscause %p\n", mcause);
+      sprint("            mepc=%p mtval=%p\n", read_csr(mepc), read_csr(mtval));
+      panic( "unexpected exception happened in M-mode.\n" );
+      break;
+  }
 }
 ```
 
