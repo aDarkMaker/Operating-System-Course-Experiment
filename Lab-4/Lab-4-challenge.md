@@ -5218,7 +5218,7 @@ void get_base_name(const char *path, char *base_name);
 
 # 通关操作
 
-- 用以下代码替换 `strap.c`
+- 用以下代码替换`strap.c`
 
 ```c
 #include "riscv.h"
@@ -5246,14 +5246,35 @@ void handle_mtimer_trap() {
 }
 
 void handle_user_page_fault(uint64 mcause, uint64 sepc, uint64 stval) {
+  sprint("handle_page_fault: %lx\n", stval);
+
   if (mcause != CAUSE_STORE_PAGE_FAULT && mcause != CAUSE_LOAD_PAGE_FAULT) {
-    panic("unknown page fault.\n");
+    sprint("unknown page fault.\n");
+    panic("unsupported page fault.\n");
   }
 
-  void* pa = alloc_page();
-  if (pa == 0) panic("alloc_page failed\n");
-  user_vm_map((pagetable_t)current->pagetable, ROUNDDOWN(stval, PGSIZE), PGSIZE, (uint64)pa,
-         prot_to_type(PROT_WRITE | PROT_READ, 1));
+  if (current == NULL) panic("no current process when page fault happens.\n");
+
+  mapped_region *stack_region = &current->mapped_info[STACK_SEGMENT];
+  uint64 fault_page = ROUNDDOWN(stval, PGSIZE);
+
+  if (fault_page >= stack_region->va &&
+      fault_page < stack_region->va + stack_region->npages * PGSIZE) {
+    panic("page fault triggered on an already mapped page.\n");
+  }
+
+  if (fault_page != stack_region->va - PGSIZE) {
+    sprint("page fault address %lx is not adjacent to current stack.\n", fault_page);
+    panic("currently we only grow stack downward by one page.\n");
+  }
+
+  void *new_page = alloc_page();
+  if (new_page == NULL) panic("no memory for stack growth.\n");
+
+  user_vm_map(current->pagetable, fault_page, PGSIZE, (uint64)new_page,
+              prot_to_type(PROT_READ | PROT_WRITE, 1));
+  stack_region->va = fault_page;
+  stack_region->npages += 1;
 }
 
 void rrsched() {
@@ -5289,7 +5310,7 @@ void smode_trap_handler(void) {
     default:
       sprint("smode_trap_handler(): unexpected scause %p\n", read_csr(scause));
       sprint("            sepc=%p stval=%p\n", read_csr(sepc), read_csr(stval));
-      panic( "unexpected exception happened.\n" );
+      panic("unexpected exception happened.\n");
       break;
   }
 
@@ -5297,963 +5318,146 @@ void smode_trap_handler(void) {
 }
 ```
 
-- 用以下代码替换 `mtrap.c`
-
-```c
-#include "kernel/riscv.h"
-#include "kernel/process.h"
-#include "spike_interface/spike_utils.h"
-
-static void handle_instruction_access_fault() { panic("Instruction access fault!"); }
-
-static void handle_load_access_fault() { panic("Load access fault!"); }
-
-static void handle_store_access_fault() { panic("Store/AMO access fault!"); }
-
-static void handle_illegal_instruction() {
-  sprint("Illegal instruction!\n");
-  panic("Illegal instruction!");
-}
-
-static void handle_misaligned_load() { panic("Misaligned Load!"); }
-
-static void handle_misaligned_store() { panic("Misaligned AMO!"); }
-
-static void handle_timer() {
-  int cpuid = 0;
-  *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
-  write_csr(sip, SIP_SSIP);
-}
-
-void handle_mtrap() {
-  uint64 mcause = read_csr(mcause);
-  switch (mcause) {
-    case CAUSE_MTIMER:
-      handle_timer();
-      break;
-    case CAUSE_FETCH_ACCESS:
-      handle_instruction_access_fault();
-      break;
-    case CAUSE_LOAD_ACCESS:
-      handle_load_access_fault();
-      break;
-    case CAUSE_STORE_ACCESS:
-      handle_store_access_fault();
-      break;
-    case CAUSE_ILLEGAL_INSTRUCTION:
-      handle_illegal_instruction();
-      break;
-    case CAUSE_MISALIGNED_LOAD:
-      handle_misaligned_load();
-      break;
-    case CAUSE_MISALIGNED_STORE:
-      handle_misaligned_store();
-      break;
-
-    default:
-      sprint("machine trap(): unexpected mscause %p\n", mcause);
-      sprint("            mepc=%p mtval=%p\n", read_csr(mepc), read_csr(mtval));
-      panic( "unexpected exception happened in M-mode.\n" );
-      break;
-  }
-}
-```
-
-- 用以下代码替换 `process.c`
-
-```c
-#include "riscv.h"
-#include "strap.h"
-#include "config.h"
-#include "process.h"
-#include "elf.h"
-#include "string.h"
-#include "vmm.h"
-#include "pmm.h"
-#include "memlayout.h"
-#include "sched.h"
-#include "spike_interface/spike_utils.h"
-
-extern char smode_trap_vector[];
-extern void return_to_user(trapframe *, uint64 satp);
-extern char trap_sec_start[];
-
-process procs[NPROC];
-process* current = NULL;
-
-void switch_to(process* proc) {
-  assert(proc);
-  current = proc;
-
-  write_csr(stvec, (uint64)smode_trap_vector);
-
-  proc->trapframe->kernel_sp = proc->kstack;
-  proc->trapframe->kernel_satp = read_csr(satp);
-  proc->trapframe->kernel_trap = (uint64)smode_trap_handler;
-
-  unsigned long x = read_csr(sstatus);
-  x &= ~SSTATUS_SPP;
-  x |= SSTATUS_SPIE;
-  write_csr(sstatus, x);
-
-  write_csr(sepc, proc->trapframe->epc);
-
-  uint64 user_satp = MAKE_SATP(proc->pagetable);
-  return_to_user(proc->trapframe, user_satp);
-}
-
-void init_proc_pool() {
-  memset( procs, 0, sizeof(process)*NPROC );
-
-  for (int i = 0; i < NPROC; ++i) {
-    procs[i].status = FREE;
-    procs[i].pid = i;
-  }
-}
-
-process* alloc_process() {
-  int i;
-  for( i=0; i<NPROC; i++ )
-    if( procs[i].status == FREE ) break;
-
-  if( i>=NPROC ){
-    panic( "cannot find any free process structure.\n" );
-    return 0;
-  }
-
-  procs[i].trapframe = (trapframe *)alloc_page();
-  memset(procs[i].trapframe, 0, sizeof(trapframe));
-
-  procs[i].pagetable = (pagetable_t)alloc_page();
-  memset((void *)procs[i].pagetable, 0, PGSIZE);
-
-  procs[i].kstack = (uint64)alloc_page() + PGSIZE;
-  uint64 user_stack = (uint64)alloc_page();
-  procs[i].trapframe->regs.sp = USER_STACK_TOP;
-
-  procs[i].mapped_info = (mapped_region*)alloc_page();
-  memset( procs[i].mapped_info, 0, PGSIZE );
-
-  user_vm_map((pagetable_t)procs[i].pagetable, USER_STACK_TOP - PGSIZE, PGSIZE,
-    user_stack, prot_to_type(PROT_WRITE | PROT_READ, 1));
-  procs[i].mapped_info[STACK_SEGMENT].va = USER_STACK_TOP - PGSIZE;
-  procs[i].mapped_info[STACK_SEGMENT].npages = 1;
-  procs[i].mapped_info[STACK_SEGMENT].seg_type = STACK_SEGMENT;
-
-  user_vm_map((pagetable_t)procs[i].pagetable, (uint64)procs[i].trapframe, PGSIZE,
-    (uint64)procs[i].trapframe, prot_to_type(PROT_WRITE | PROT_READ, 0));
-  procs[i].mapped_info[CONTEXT_SEGMENT].va = (uint64)procs[i].trapframe;
-  procs[i].mapped_info[CONTEXT_SEGMENT].npages = 1;
-  procs[i].mapped_info[CONTEXT_SEGMENT].seg_type = CONTEXT_SEGMENT;
-
-  user_vm_map((pagetable_t)procs[i].pagetable, (uint64)trap_sec_start, PGSIZE,
-    (uint64)trap_sec_start, prot_to_type(PROT_READ | PROT_EXEC, 0));
-  procs[i].mapped_info[SYSTEM_SEGMENT].va = (uint64)trap_sec_start;
-  procs[i].mapped_info[SYSTEM_SEGMENT].npages = 1;
-  procs[i].mapped_info[SYSTEM_SEGMENT].seg_type = SYSTEM_SEGMENT;
-
-  sprint("in alloc_proc. user frame 0x%lx, user stack 0x%lx, user kstack 0x%lx \n",
-    procs[i].trapframe, procs[i].trapframe->regs.sp, procs[i].kstack);
-
-  procs[i].user_heap.heap_top = USER_FREE_ADDRESS_START;
-  procs[i].user_heap.heap_bottom = USER_FREE_ADDRESS_START;
-  procs[i].user_heap.free_pages_count = 0;
-
-  procs[i].total_mapped_region = 3;
-  procs[i].tick_count = 0;
-  procs[i].status = READY;
-
-  procs[i].pfiles = init_proc_file_management();
-  sprint("in alloc_proc. build proc_file_management successfully.\n");
-
-  return &procs[i];
-}
-
-int free_process( process* proc ) {
-  proc->status = ZOMBIE;
-  return 0;
-}
-
-int do_fork( process* parent)
-{
-  sprint( "will fork a child from parent %d.\n", parent->pid );
-  process* child = alloc_process();
-
-  *child->trapframe = *parent->trapframe;
-
-  memcpy((void*)lookup_pa(child->pagetable, child->mapped_info[STACK_SEGMENT].va),
-         (void*)lookup_pa(parent->pagetable, parent->mapped_info[STACK_SEGMENT].va), PGSIZE);
-
-  for( int i=3; i<parent->total_mapped_region; i++ ){
-    mapped_region* reg = &parent->mapped_info[i];
-    if (reg->seg_type == CODE_SEGMENT) {
-      for (int j = 0; j < reg->npages; j++) {
-        uint64 va = reg->va + j * PGSIZE;
-        uint64 pa = lookup_pa(parent->pagetable, va);
-        user_vm_map(child->pagetable, va, PGSIZE, pa, prot_to_type(PROT_READ | PROT_EXEC, 1));
-      }
-      sprint("do_fork map code segment at pa:%016lx of parent to child at va:%016lx.\n",
-             lookup_pa(parent->pagetable, reg->va), reg->va);
-    } else if (reg->seg_type == DATA_SEGMENT || reg->seg_type == HEAP_SEGMENT) {
-      for (int j = 0; j < reg->npages; j++) {
-        uint64 va = reg->va + j * PGSIZE;
-        void* pa = alloc_page();
-        memcpy(pa, (void*)lookup_pa(parent->pagetable, va), PGSIZE);
-        user_vm_map(child->pagetable, va, PGSIZE, (uint64)pa, prot_to_type(PROT_WRITE | PROT_READ, 1));
-      }
-    }
-    child->mapped_info[i] = *reg;
-    child->total_mapped_region++;
-  }
-
-  child->status = READY;
-  child->trapframe->regs.a0 = 0;
-  child->parent = parent;
-  insert_to_ready_queue( child );
-
-  return child->pid;
-}
-```
-
-- 用以下代码替换 `vmm.c`
+- 用以下代码替换`vmm.c`
 
 ```c
 #include "vmm.h"
 #include "riscv.h"
 #include "pmm.h"
+#include "util/types.h"
 #include "memlayout.h"
 #include "util/string.h"
-#include "util/functions.h"
 #include "spike_interface/spike_utils.h"
+#include "util/functions.h"
 
-pagetable_t g_kernel_pagetable;
+int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+  uint64 first, last;
+  pte_t *pte;
+
+  for (first = ROUNDDOWN(va, PGSIZE), last = ROUNDDOWN(va + size - 1, PGSIZE);
+      first <= last; first += PGSIZE, pa += PGSIZE) {
+    if ((pte = page_walk(page_dir, first, 1)) == 0) return -1;
+    if (*pte & PTE_V)
+      panic("map_pages fails on mapping va (0x%lx) to pa (0x%lx)", first, pa);
+    *pte = PA2PTE(pa) | perm | PTE_V;
+  }
+  return 0;
+}
 
 uint64 prot_to_type(int prot, int user) {
-  uint64 pte_flags = PTE_V;
-  if (prot & PROT_READ) pte_flags |= PTE_R;
-  if (prot & PROT_WRITE) pte_flags |= PTE_W;
-  if (prot & PROT_EXEC) pte_flags |= PTE_X;
-  if (user) pte_flags |= PTE_U;
-  return pte_flags;
+  uint64 perm = 0;
+  if (prot & PROT_READ) perm |= PTE_R | PTE_A;
+  if (prot & PROT_WRITE) perm |= PTE_W | PTE_D;
+  if (prot & PROT_EXEC) perm |= PTE_X | PTE_A;
+  if (perm == 0) perm = PTE_R;
+  if (user) perm |= PTE_U;
+  return perm;
 }
 
-void kern_vm_init() {
-  g_kernel_pagetable = (pagetable_t)alloc_page();
-  memset((void *)g_kernel_pagetable, 0, PGSIZE);
+pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
+  if (va >= MAXVA) panic("page_walk");
 
-  extern char _etext[];
-  // Map kernel text section [KERN_BASE, _etext] with R-X permissions
-  uint64 text_start = (uint64)KERN_BASE;
-  uint64 text_end = ROUNDUP((uint64)_etext, PGSIZE);
-  // Limit mapping to avoid timeout - only map up to 2MB of kernel code
-  if (text_end - text_start > (2 << 20)) {
-    text_end = text_start + (2 << 20);
-  }
-  for (uint64 va = text_start; va < text_end; va += PGSIZE) {
-    pte_t* pte = page_walk(g_kernel_pagetable, va, 1);
-    if (pte) *pte = PA2PTE(va) | PTE_V | PTE_R | PTE_X;
-  }
-}
-
-void* user_va_to_pa(pagetable_t page_dir, void* va) {
-  uint64 off = (uint64)va - ROUNDDOWN((uint64)va, PGSIZE);
-  return (void*)(lookup_pa(page_dir, (uint64)va) + off);
-}
-
-void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa , int perm) {
-  for (uint64 i = 0; i < size; i += PGSIZE) {
-    pte_t* pte = page_walk(page_dir, va + i, 1);
-    assert(pte);
-    assert(!(*pte & PTE_V));
-    *pte = PA2PTE(pa + i) | perm | PTE_V;
-  }
-}
-
-void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free_pa) {
-  for (uint64 i = 0; i < size; i += PGSIZE) {
-    pte_t* pte = page_walk(page_dir, va + i, 0);
-    if (pte && (*pte & PTE_V)) {
-      if (free_pa) free_page((void*)PTE2PA(*pte));
-      *pte = 0;
-    }
-  }
-}
-
-pte_t* page_walk(pagetable_t page_dir, uint64 va, int alloc) {
-  if (va >= MAXVA) panic("page_walk: va out of range!\n");
+  pagetable_t pt = page_dir;
 
   for (int level = 2; level > 0; level--) {
-    pte_t* pte = &page_dir[PX(level, va)];
+    pte_t *pte = pt + PX(level, va);
+
     if (*pte & PTE_V) {
-      page_dir = (pagetable_t)PTE2PA(*pte);
+      pt = (pagetable_t)PTE2PA(*pte);
     } else {
-      if (!alloc || (page_dir = (pagetable_t)alloc_page()) == 0) return 0;
-      memset(page_dir, 0, PGSIZE);
-      *pte = PA2PTE(page_dir) | PTE_V;
-    }
-  }
-  return &page_dir[PX(0, va)];
-}
-
-uint64 lookup_pa(pagetable_t page_dir, uint64 va) {
-  pte_t* pte = page_walk(page_dir, va, 0);
-  if (pte == 0 || !(*pte & PTE_V) || !(*pte & PTE_U)) return 0;
-  return PTE2PA(*pte);
-}
-```
-
-- 用以下代码替换 `vfs.c`
-
-```c
-#include "vfs.h"
-#include "pmm.h"
-#include "spike_interface/spike_utils.h"
-#include "util/string.h"
-#include "util/types.h"
-#include "util/hash_table.h"
-#include "process.h"
-
-#ifndef MAX_FS_TYPE
-#define MAX_FS_TYPE 10
-#endif
-
-struct dentry *vfs_root_dentry;
-struct super_block *vfs_sb_list[MAX_MOUNTS];
-struct device *vfs_dev_list[MAX_VFS_DEV];
-struct file_system_type *fs_list[MAX_FS_TYPE];
-struct hash_table dentry_hash_table;
-struct hash_table vinode_hash_table;
-
-int vfs_init() {
-  int ret;
-  ret = hash_table_init(&dentry_hash_table, dentry_hash_equal, dentry_hash_func,
-                            NULL, NULL, NULL);
-  if (ret != 0) return ret;
-
-  ret = hash_table_init(&vinode_hash_table, vinode_hash_equal, vinode_hash_func,
-                            NULL, NULL, NULL);
-  if (ret != 0) return ret;
-  return 0; 
-}
-
-struct super_block *vfs_mount(const char *dev_name, int mnt_type) {
-  struct device *p_device = NULL;
-  for (int i = 0; i < MAX_VFS_DEV; ++i) {
-    p_device = vfs_dev_list[i];
-    if (p_device && strcmp(p_device->dev_name, dev_name) == 0) break;
-  }
-  if (p_device == NULL) panic("vfs_mount: cannot find the device entry!\n");
-
-  struct file_system_type *fs_type = p_device->fs_type;
-  struct super_block *sb = fs_type->get_superblock(p_device);
-  hash_put_vinode(sb->s_root->dentry_inode);
-
-  int err = 1;
-  for (int i = 0; i < MAX_MOUNTS; ++i) {
-    if (vfs_sb_list[i] == NULL) {
-      vfs_sb_list[i] = sb;
-      err = 0;
-      break;
-    }
-  }
-  if (err) panic("vfs_mount: too many mounts!\n");
-
-  if (mnt_type == MOUNT_AS_ROOT) {
-    vfs_root_dentry = sb->s_root;
-    hash_put_dentry(sb->s_root);
-  } else if (mnt_type == MOUNT_DEFAULT) {
-    if (!vfs_root_dentry)
-      panic("vfs_mount: root dentry not found, please mount the root device first!\n");
-
-    struct dentry *mnt_point = sb->s_root;
-    char *dev_name = p_device->dev_name;
-    strcpy(mnt_point->name, dev_name);
-    mnt_point->parent = vfs_root_dentry;
-    hash_put_dentry(sb->s_root);
-  } else {
-    panic("vfs_mount: unknown mount type!\n");
-  }
-
-  return sb;
-}
-
-struct dentry *lookup_final_dentry(const char *path, struct dentry **parent,
-                                   char *miss_name) {
-  char path_copy[MAX_PATH_LEN];
-  strcpy(path_copy, path);
-
-  struct dentry *this;
-  if (path[0] == '/') {
-    this = vfs_root_dentry;
-  } else {
-    this = current->pfiles->cwd;
-  }
-
-  char *token = strtok(path_copy, "/");
-  while (token != NULL) {
-    if (strcmp(token, ".") == 0) {
-      // current directory, do nothing
-    } else if (strcmp(token, "..") == 0) {
-      // parent directory
-      if (this->parent != NULL) {
-        this = this->parent;
-      }
-    } else {
-      *parent = this;
-      struct dentry *next = hash_get_dentry((*parent), token);
-      if (next == NULL) {
-        next = alloc_vfs_dentry(token, NULL, *parent);
-        struct vinode *found_vinode = viop_lookup((*parent)->dentry_inode, next);
-        if (found_vinode == NULL) {
-          free_page(next);
-          strcpy(miss_name, token);
-          return NULL;
-        }
-
-        struct vinode *same_inode = hash_get_vinode(found_vinode->sb, found_vinode->inum);
-        if (same_inode != NULL) {
-          next->dentry_inode = same_inode;
-          same_inode->ref++;
-          free_page(found_vinode);
-        } else {
-          next->dentry_inode = found_vinode;
-          found_vinode->ref++;
-          hash_put_vinode(found_vinode);
-        }
-        hash_put_dentry(next);
-      }
-      this = next;
-    }
-    token = strtok(NULL, "/");
-  }
-  return this;
-}
-
-struct file *vfs_open(const char *path, int flags) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
-
-  if (!file_dentry) {
-    int creatable = flags & O_CREAT;
-    if (creatable) {
-      char basename[MAX_PATH_LEN];
-      get_base_name(path, basename);
-      if (strcmp(miss_name, basename) != 0) {
-        sprint("vfs_open: cannot create file in a non-exist directory!\n");
-        return NULL;
-      }
-      file_dentry = alloc_vfs_dentry(basename, NULL, parent);
-      struct vinode *new_inode = viop_create(parent->dentry_inode, file_dentry);
-      if (!new_inode) panic("vfs_open: cannot create file!\n");
-      file_dentry->dentry_inode = new_inode;
-      new_inode->ref++;
-      hash_put_dentry(file_dentry);
-      hash_put_vinode(new_inode); 
-    } else {
-      sprint("vfs_open: cannot find the file!\n");
-      return NULL;
+      if( alloc && ((pt = (pte_t *)alloc_page(1)) != 0) ){
+        memset(pt, 0, PGSIZE);
+        *pte = PA2PTE(pt) | PTE_V;
+      } else
+        return 0;
     }
   }
 
-  if (file_dentry->dentry_inode->type != FILE_I) {
-    sprint("vfs_open: cannot open a directory!\n");
-    return NULL;
-  }
-
-  int writable = 0, readable = 0;
-  switch (flags & MASK_FILEMODE) {
-    case O_RDONLY: writable = 0; readable = 1; break;
-    case O_WRONLY: writable = 1; readable = 0; break;
-    case O_RDWR:   writable = 1; readable = 1; break;
-    default:       panic("fs_open: invalid open flags!\n");
-  }
-
-  struct file *file = alloc_vfs_file(file_dentry, readable, writable, 0);
-  if (file_dentry->dentry_inode->i_ops->viop_hook_open) {
-    if (file_dentry->dentry_inode->i_ops->viop_hook_open(file_dentry->dentry_inode, file_dentry) < 0) {
-      sprint("vfs_open: hook_open failed!\n");
-    }
-  }
-  return file;
+  return pt + PX(0, va);
 }
 
-ssize_t vfs_read(struct file *file, char *buf, size_t count) {
-  if (!file->readable) return -1;
-  if (file->f_dentry->dentry_inode->type != FILE_I) return -1;
-  return viop_read(file->f_dentry->dentry_inode, buf, count, &(file->offset));
-}
+uint64 lookup_pa(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
 
-ssize_t vfs_write(struct file *file, const char *buf, size_t count) {
-  if (!file->writable) return -1;
-  if (file->f_dentry->dentry_inode->type != FILE_I) return -1;
-  return viop_write(file->f_dentry->dentry_inode, buf, count, &(file->offset));
-}
+  if (va >= MAXVA) return 0;
 
-ssize_t vfs_lseek(struct file *file, ssize_t offset, int whence) {
-  if (file->f_dentry->dentry_inode->type != FILE_I) return -1;
-  if (viop_lseek(file->f_dentry->dentry_inode, offset, whence, &(file->offset)) != 0) return -1;
-  return file->offset;
-}
-
-int vfs_stat(struct file *file, struct istat *istat) {
-  istat->st_inum = file->f_dentry->dentry_inode->inum;
-  istat->st_size = file->f_dentry->dentry_inode->size;
-  istat->st_type = file->f_dentry->dentry_inode->type;
-  istat->st_nlinks = file->f_dentry->dentry_inode->nlinks;
-  istat->st_blocks = file->f_dentry->dentry_inode->blocks;
-  return 0;
-}
-
-int vfs_disk_stat(struct file *file, struct istat *istat) {
-  return viop_disk_stat(file->f_dentry->dentry_inode, istat);
-}
-
-int vfs_link(const char *oldpath, const char *newpath) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *old_file_dentry = lookup_final_dentry(oldpath, &parent, miss_name);
-  if (!old_file_dentry || old_file_dentry->dentry_inode->type != FILE_I) return -1;
-
-  parent = NULL;
-  struct dentry *new_file_dentry = lookup_final_dentry(newpath, &parent, miss_name);
-  if (new_file_dentry) return -1;
-
-  char basename[MAX_PATH_LEN];
-  get_base_name(newpath, basename);
-  if (strcmp(miss_name, basename) != 0) return -1;
-
-  new_file_dentry = alloc_vfs_dentry(basename, old_file_dentry->dentry_inode, parent);
-  int err = viop_link(parent->dentry_inode, new_file_dentry, old_file_dentry->dentry_inode);
-  if (err) return -1;
-  hash_put_dentry(new_file_dentry);
-  return 0;
-}
-
-int vfs_unlink(const char *path) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
-  if (!file_dentry || file_dentry->dentry_inode->type != FILE_I || file_dentry->d_ref > 0) return -1;
-
-  struct vinode *unlinked_vinode = file_dentry->dentry_inode;
-  int err = viop_unlink(parent->dentry_inode, file_dentry, unlinked_vinode);
-  if (err) return -1;
-
-  hash_erase_dentry(file_dentry);
-  free_vfs_dentry(file_dentry);
-  unlinked_vinode->ref--; 
-  if (unlinked_vinode->nlinks == 0) {
-    assert(unlinked_vinode->ref == 0);
-    hash_erase_vinode(unlinked_vinode);
-    free_page(unlinked_vinode);
-  }
-  return 0;
-}
-
-int vfs_close(struct file *file) {
-  if (file->f_dentry->dentry_inode->type != FILE_I) return -1;
-  struct dentry *dentry = file->f_dentry;
-  struct vinode *inode = dentry->dentry_inode;
-  if (inode->i_ops->viop_hook_close) inode->i_ops->viop_hook_close(inode, dentry);
-  dentry->d_ref--;
-  if (dentry->d_ref == 0) {
-    hash_erase_dentry(dentry);
-    free_vfs_dentry(dentry);
-    inode->ref--;
-    if (inode->ref == 0) {
-      if (viop_write_back_vinode(inode) != 0) panic("vfs_close: free inode failed!\n");
-      hash_erase_vinode(inode);
-      free_page(inode);
-    }
-  }
-  file->status = FD_NONE;
-  return 0;
-}
-
-struct file *vfs_opendir(const char *path) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
-  if (!file_dentry || file_dentry->dentry_inode->type != DIR_I) return NULL;
-  struct file *file = alloc_vfs_file(file_dentry, 1, 0, 0);
-  if (file_dentry->dentry_inode->i_ops->viop_hook_opendir) {
-    if (file_dentry->dentry_inode->i_ops->viop_hook_opendir(file_dentry->dentry_inode, file_dentry) != 0) return NULL;
-  }
-  return file;
-}
-
-int vfs_readdir(struct file *file, struct dir *dir) {
-  return viop_readdir(file->f_dentry->dentry_inode, dir, &(file->offset));
-}
-
-int vfs_mkdir(const char *path) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
-  if (file_dentry) return -1;
-  char basename[MAX_PATH_LEN];
-  get_base_name(path, basename);
-  if (strcmp(miss_name, basename) != 0) return -1;
-  struct dentry *new_dentry = alloc_vfs_dentry(basename, NULL, parent);
-  struct vinode *new_inode = viop_mkdir(parent->dentry_inode, new_dentry);
-  if (!new_inode) { free_page(new_dentry); return -1; }
-  new_dentry->dentry_inode = new_inode;
-  new_inode->ref++;
-  hash_put_dentry(new_dentry);
-  hash_put_vinode(new_inode);
-  return 0;
-}
-
-int vfs_closedir(struct file *file) {
-  if (file->f_dentry->dentry_inode->type != DIR_I) return -1;
-  if (file->f_dentry->dentry_inode->i_ops->viop_hook_closedir)
-    file->f_dentry->dentry_inode->i_ops->viop_hook_closedir(file->f_dentry->dentry_inode, file->f_dentry);
-  file->f_dentry->d_ref--;
-  if (file->f_dentry->d_ref == 0) {
-    hash_erase_dentry(file->f_dentry);
-    struct vinode *inode = file->f_dentry->dentry_inode;
-    free_vfs_dentry(file->f_dentry);
-    inode->ref--;
-    if (inode->ref == 0) {
-      viop_write_back_vinode(inode);
-      hash_erase_vinode(inode);
-      free_page(inode);
-    }
-  }
-  file->status = FD_NONE;
-  return 0;
-}
-
-struct dentry *alloc_vfs_dentry(const char *name, struct vinode *inode, struct dentry *parent) {
-  struct dentry *dentry = (struct dentry *)alloc_page();
-  strcpy(dentry->name, name);
-  dentry->dentry_inode = inode;
-  if (inode) inode->ref++;
-  dentry->parent = parent;
-  dentry->d_ref = 0;
-  return dentry;
-}
-
-int free_vfs_dentry(struct dentry *dentry) {
-  if (dentry->d_ref > 0) return -1;
-  free_page((void *)dentry);
-  return 0;
-}
-
-int dentry_hash_equal(void *key1, void *key2) {
-  struct dentry_key *k1 = key1, *k2 = key2;
-  return (strcmp(k1->name, k2->name) == 0 && k1->parent == k2->parent);
-}
-
-size_t dentry_hash_func(void *key) {
-  struct dentry_key *k = key;
-  char *name = k->name;
-  size_t hash = 5381;
-  int c;
-  while ((c = *name++)) hash = ((hash << 5) + hash) + c;
-  hash = ((hash << 5) + hash) + (size_t)k->parent;
-  return hash % HASH_TABLE_SIZE;
-}
-
-struct dentry *hash_get_dentry(struct dentry *parent, char *name) {
-  struct dentry_key key = {.parent = parent, .name = name};
-  return (struct dentry *)dentry_hash_table.virtual_hash_get(&dentry_hash_table, &key);
-}
-
-int hash_put_dentry(struct dentry *dentry) {
-  struct dentry_key *key = alloc_page();
-  key->name = dentry->name;
-  key->parent = dentry->parent;
-  return dentry_hash_table.virtual_hash_put(&dentry_hash_table, key, dentry);
-}
-
-int hash_erase_dentry(struct dentry *dentry) {
-  struct dentry_key key = {.parent = dentry->parent, .name = dentry->name};
-  return dentry_hash_table.virtual_hash_erase(&dentry_hash_table, &key);
-}
-
-// Vinode Hash helpers
-int vinode_hash_equal(void *key1, void *key2) {
-  struct vinode_key *k1 = key1, *k2 = key2;
-  return (k1->sb == k2->sb && k1->inum == k2->inum);
-}
-
-size_t vinode_hash_func(void *key) {
-  struct vinode_key *k = key;
-  return ((size_t)k->sb + k->inum) % HASH_TABLE_SIZE;
-}
-
-struct vinode *hash_get_vinode(struct super_block *sb, int inum) {
-  struct vinode_key key = {.sb = sb, .inum = inum};
-  return (struct vinode *)vinode_hash_table.virtual_hash_get(&vinode_hash_table, &key);
-}
-
-int hash_put_vinode(struct vinode *vinode) {
-  struct vinode_key *key = alloc_page();
-  key->sb = vinode->sb;
-  key->inum = vinode->inum;
-  return vinode_hash_table.virtual_hash_put(&vinode_hash_table, key, vinode);
-}
-
-int hash_erase_vinode(struct vinode *vinode) {
-  struct vinode_key key = {.sb = vinode->sb, .inum = vinode->inum};
-  return vinode_hash_table.virtual_hash_erase(&vinode_hash_table, &key);
-}
-
-struct vinode *default_alloc_vinode(struct super_block *sb) {
-  struct vinode *vinode = (struct vinode *)alloc_page();
-  vinode->sb = sb;
-  vinode->ref = 0;
-  return vinode;
-}
-
-struct file *alloc_vfs_file(struct dentry *dentry, int readable, int writable, int offset) {
-  struct file *file = alloc_page();
-  file->f_dentry = dentry;
-  dentry->d_ref += 1;
-  file->readable = readable;
-  file->writable = writable;
-  file->offset = 0;
-  file->status = FD_OPENED;
-  return file;
-}
-
-void get_base_name(const char *path, char *base_name) {
-  char path_copy[MAX_PATH_LEN];
-  strcpy(path_copy, path);
-  char *token = strtok(path_copy, "/");
-  char *last_token = NULL;
-  while (token != NULL) {
-    last_token = token;
-    token = strtok(NULL, "/");
-  }
-  strcpy(base_name, last_token);
-}
-```
-
-- 用以下代码替换 `proc_file.h`
-
-```c
-#ifndef _PROC_FILE_H_
-#define _PROC_FILE_H_
-
-#include "spike_interface/spike_file.h"
-#include "util/types.h"
-#include "vfs.h"
-
-int do_open(char *pathname, int flags);
-int do_read(int fd, char *buf, uint64 count);
-int do_write(int fd, char *buf, uint64 count);
-int do_lseek(int fd, int offset, int whence);
-int do_stat(int fd, struct istat *istat);
-int do_disk_stat(int fd, struct istat *istat);
-int do_close(int fd);
-
-int do_opendir(char *pathname);
-int do_readdir(int fd, struct dir *dir);
-int do_mkdir(char *pathname);
-int do_closedir(int fd);
-
-int do_link(char *oldpath, char *newpath);
-int do_unlink(char *path);
-
-int do_ccwd(char *pathname);
-int do_rcwd(char *pathname);
-
-void fs_init(void);
-
-typedef struct proc_file_management_t {
-  struct dentry *cwd;
-  struct file opened_files[MAX_FILES];
-  int nfiles;
-} proc_file_management;
-
-proc_file_management *init_proc_file_management(void);
-
-void reclaim_proc_file_management(proc_file_management *pfiles);
-
-#endif
-```
-
-- 用以下代码替换 `proc_file.c`
-
-```c
-#include "proc_file.h"
-#include "hostfs.h"
-#include "pmm.h"
-#include "process.h"
-#include "ramdev.h"
-#include "rfs.h"
-#include "riscv.h"
-#include "spike_interface/spike_file.h"
-#include "spike_interface/spike_utils.h"
-#include "util/functions.h"
-#include "util/string.h"
-
-void fs_init(void) {
-  vfs_init();
-  if( register_hostfs() < 0 ) panic( "fs_init: cannot register hostfs.\n" );
-  struct device *hostdev = init_host_device("HOSTDEV");
-  vfs_mount("HOSTDEV", MOUNT_AS_ROOT);
-  if( register_rfs() < 0 ) panic( "fs_init: cannot register rfs.\n" );
-  struct device *ramdisk0 = init_rfs_device("RAMDISK0");
-  rfs_format_dev(ramdisk0);
-  vfs_mount("RAMDISK0", MOUNT_DEFAULT);
-}
-
-proc_file_management *init_proc_file_management(void) {
-  proc_file_management *pfiles = (proc_file_management *)alloc_page();
-  pfiles->cwd = vfs_root_dentry;
-  pfiles->nfiles = 0;
-  for (int fd = 0; fd < MAX_FILES; ++fd) pfiles->opened_files[fd].status = FD_NONE;
-  sprint("FS: created a file management struct for a process.\n");
-  return pfiles;
-}
-
-void reclaim_proc_file_management(proc_file_management *pfiles) {
-  free_page(pfiles);
-}
-
-struct file *get_opened_file(int fd) {
-  struct file *pfile = NULL;
-  for (int i = 0; i < MAX_FILES; ++i) {
-    pfile = &(current->pfiles->opened_files[i]);
-    if (i == fd) break;
-  }
-  if (pfile == NULL) panic("do_read: invalid fd!\n");
-  return pfile;
-}
-
-int do_open(char *pathname, int flags) {
-  struct file *opened_file = vfs_open(pathname, flags);
-  if (opened_file == NULL) return -1;
-  int fd = 0;
-  if (current->pfiles->nfiles >= MAX_FILES) panic("do_open: no file entry for current process!\n");
-  struct file *pfile;
-  for (fd = 0; fd < MAX_FILES; ++fd) {
-    pfile = &(current->pfiles->opened_files[fd]);
-    if (pfile->status == FD_NONE) break;
-  }
-  memcpy(pfile, opened_file, sizeof(struct file));
-  ++current->pfiles->nfiles;
-  return fd;
-}
-
-int do_read(int fd, char *buf, uint64 count) {
-  struct file *pfile = get_opened_file(fd);
-  if (pfile->readable == 0) panic("do_read: no readable file!\n");
-  char buffer[count + 1];
-  int len = vfs_read(pfile, buffer, count);
-  buffer[count] = '\0';
-  strcpy(buf, buffer);
-  return len;
-}
-
-int do_write(int fd, char *buf, uint64 count) {
-  struct file *pfile = get_opened_file(fd);
-  if (pfile->writable == 0) panic("do_write: cannot write file!\n");
-  return vfs_write(pfile, buf, count);
-}
-
-int do_lseek(int fd, int offset, int whence) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_lseek(pfile, offset, whence);
-}
-
-int do_stat(int fd, struct istat *istat) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_stat(pfile, istat);
-}
-
-int do_disk_stat(int fd, struct istat *istat) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_disk_stat(pfile, istat);
-}
-
-int do_close(int fd) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_close(pfile);
-}
-
-int do_opendir(char *pathname) {
-  struct file *opened_file = vfs_opendir(pathname);
-  if (opened_file == NULL) return -1;
-  int fd = 0;
-  struct file *pfile;
-  for (fd = 0; fd < MAX_FILES; ++fd) {
-    pfile = &(current->pfiles->opened_files[fd]);
-    if (pfile->status == FD_NONE) break;
-  }
-  if (pfile->status != FD_NONE) panic("do_opendir: no file entry for current process!\n");
-  memcpy(pfile, opened_file, sizeof(struct file));
-  ++current->pfiles->nfiles;
-  return fd;
-}
-
-int do_readdir(int fd, struct dir *dir) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_readdir(pfile, dir);
-}
-
-int do_mkdir(char *pathname) {
-  return vfs_mkdir(pathname);
-}
-
-int do_closedir(int fd) {
-  struct file *pfile = get_opened_file(fd);
-  return vfs_closedir(pfile);
-}
-
-int do_link(char *oldpath, char *newpath) {
-  return vfs_link(oldpath, newpath);
-}
-
-int do_unlink(char *path) {
-  return vfs_unlink(path);
-}
-
-int do_ccwd(char *pathname) {
-  struct dentry *parent = NULL;
-  char miss_name[MAX_PATH_LEN];
-  struct dentry *dir_dentry = lookup_final_dentry(pathname, &parent, miss_name);
-  if (!dir_dentry || dir_dentry->dentry_inode->type != DIR_I) return -1;
-  current->pfiles->cwd = dir_dentry;
-  return 0;
-}
-
-int do_rcwd(char *pathname) {
-  struct dentry *this = current->pfiles->cwd;
-  if (this == vfs_root_dentry) {
-    strcpy(pathname, "/");
+  pte = page_walk(pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0 || ((*pte & PTE_R) == 0 && (*pte & PTE_W) == 0))
     return 0;
+  pa = PTE2PA(*pte);
+
+  return pa;
+}
+
+extern char _etext[];
+pagetable_t g_kernel_pagetable;
+
+void kern_vm_map(pagetable_t page_dir, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (map_pages(page_dir, va, sz, pa, perm) != 0) panic("kern_vm_map");
+}
+
+void kern_vm_init(void) {
+  pagetable_t t_page_dir;
+
+  t_page_dir = (pagetable_t)alloc_page();
+  memset(t_page_dir, 0, PGSIZE);
+
+  kern_vm_map(t_page_dir, KERN_BASE, DRAM_BASE, (uint64)_etext - KERN_BASE,
+         prot_to_type(PROT_READ | PROT_EXEC, 0));
+
+  sprint("KERN_BASE 0x%lx\n", lookup_pa(t_page_dir, KERN_BASE));
+
+  kern_vm_map(t_page_dir, (uint64)_etext, (uint64)_etext, PHYS_TOP - (uint64)_etext,
+         prot_to_type(PROT_READ | PROT_WRITE, 0));
+
+  sprint("physical address of _etext is: 0x%lx\n", lookup_pa(t_page_dir, (uint64)_etext));
+
+  g_kernel_pagetable = t_page_dir;
+}
+
+void *user_va_to_pa(pagetable_t page_dir, void *va) {
+  uint64 va_val = (uint64)va;
+  pte_t *pte = page_walk(page_dir, va_val, 0);
+  if (pte == 0) return 0;
+  if ((*pte & PTE_V) == 0) return 0;
+  if ((*pte & (PTE_R | PTE_W | PTE_X)) == 0) return 0;
+  uint64 pa = PTE2PA(*pte) + (va_val & (PGSIZE - 1));
+  return (void *)pa;
+}
+
+void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+  if (map_pages(page_dir, va, size, pa, perm) != 0) {
+    panic("fail to user_vm_map .\n");
   }
-  char stack[MAX_MOUNTS][MAX_DENTRY_NAME_LEN];
-  int top = 0;
-  // Add counter to prevent infinite loop in case of circular dentry chain
-  int count = 0;
-  while (this != vfs_root_dentry && this != NULL && count < MAX_MOUNTS) {
-    strcpy(stack[top++], this->name);
-    this = this->parent;
-    count++;
+}
+
+void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
+  if (size == 0) return;
+
+  uint64 first = ROUNDDOWN(va, PGSIZE);
+  uint64 last = ROUNDDOWN(va + size - 1, PGSIZE);
+
+  for (uint64 addr = first; addr <= last; addr += PGSIZE) {
+    pte_t *pte = page_walk(page_dir, addr, 0);
+    if (pte == 0 || (*pte & PTE_V) == 0) continue;
+
+    if (free) {
+      void *pa = (void *)PTE2PA(*pte);
+      free_page(pa);
+    }
+
+    *pte = 0;
   }
-  if (count >= MAX_MOUNTS) {
-    panic("do_rcwd: circular dentry chain detected!\n");
-  }
-  pathname[0] = '\0';
-  for (int i = top - 1; i >= 0; i--) {
-    strcat(pathname, "/");
-    strcat(pathname, stack[i]);
-  }
-  return 0;
 }
 ```
 
-- 用以下代码替换 `syscall.c`
+- 用以下代码替换`syscall.c`
 
 ```c
 #include <stdint.h>
 #include <errno.h>
+
 #include "util/types.h"
 #include "syscall.h"
 #include "string.h"
@@ -6263,6 +5467,7 @@ int do_rcwd(char *pathname) {
 #include "vmm.h"
 #include "sched.h"
 #include "proc_file.h"
+
 #include "spike_interface/spike_utils.h"
 
 ssize_t sys_user_print(const char* buf, size_t n) {
@@ -6284,6 +5489,7 @@ uint64 sys_user_allocate_page() {
   uint64 va;
   if (current->user_heap.free_pages_count > 0) {
     va =  current->user_heap.free_pages_address[--current->user_heap.free_pages_count];
+    assert(va < current->user_heap.heap_top);
   } else {
     va = current->user_heap.heap_top;
     current->user_heap.heap_top += PGSIZE;
@@ -6348,35 +5554,35 @@ ssize_t sys_user_lseek(int fd, int offset, int whence) {
 }
 
 ssize_t sys_user_stat(int fd, struct istat *istat) {
-  struct istat * istatpa = (struct istat*)user_va_to_pa((pagetable_t)(current->pagetable), istat);
-  return do_stat(fd, istatpa);
+  struct istat * pistat = (struct istat *)user_va_to_pa((pagetable_t)(current->pagetable), istat);
+  return do_stat(fd, pistat);
 }
 
 ssize_t sys_user_disk_stat(int fd, struct istat *istat) {
-  struct istat * istatpa = (struct istat*)user_va_to_pa((pagetable_t)(current->pagetable), istat);
-  return do_disk_stat(fd, istatpa);
+  struct istat * pistat = (struct istat *)user_va_to_pa((pagetable_t)(current->pagetable), istat);
+  return do_disk_stat(fd, pistat);
 }
 
 ssize_t sys_user_close(int fd) {
   return do_close(fd);
 }
 
-ssize_t sys_user_opendir(char *pathva) {
-  char* pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
+ssize_t sys_user_opendir(char * pathva){
+  char * pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
   return do_opendir(pathpa);
 }
 
-ssize_t sys_user_readdir(int fd, struct dir *dirva) {
-  struct dir * dirpa = (struct dir*)user_va_to_pa((pagetable_t)(current->pagetable), dirva);
-  return do_readdir(fd, dirpa);
+ssize_t sys_user_readdir(int fd, struct dir *vdir){
+  struct dir * pdir = (struct dir *)user_va_to_pa((pagetable_t)(current->pagetable), vdir);
+  return do_readdir(fd, pdir);
 }
 
-ssize_t sys_user_mkdir(char *pathva) {
-  char* pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
+ssize_t sys_user_mkdir(char * pathva){
+  char * pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
   return do_mkdir(pathpa);
 }
 
-ssize_t sys_user_closedir(int fd) {
+ssize_t sys_user_closedir(int fd){
   return do_closedir(fd);
 }
 
@@ -6392,48 +5598,112 @@ ssize_t sys_user_unlink(char * vfn){
 }
 
 ssize_t sys_user_rcwd(char *pathva) {
-  char pathpa[MAX_PATH_LEN];
-  int ret = do_rcwd(pathpa);
-  if (ret < 0) return ret;
-  char *user_pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
-  strcpy(user_pathpa, pathpa);
+  char *pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
+  struct dentry *cwd = current->pfiles->cwd;
+  
+  char path[MAX_PATH_LEN] = {0};
+  char temp_path[MAX_PATH_LEN] = {0};
+  struct dentry *d = cwd;
+  
+  if (d == vfs_root_dentry) {
+    strcpy(path, "/");
+  } else {
+    while (d && d != vfs_root_dentry) {
+      char temp[MAX_PATH_LEN];
+      strcpy(temp, "/");
+      strcat(temp, d->name);
+      strcat(temp, temp_path);
+      strcpy(temp_path, temp);
+      d = d->parent;
+    }
+    strcpy(path, temp_path);
+  }
+  
+  strcpy(pathpa, path);
   return 0;
 }
 
 ssize_t sys_user_ccwd(char *pathva) {
   char *pathpa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), pathva);
-  return do_ccwd(pathpa);
+  
+  struct dentry *parent = NULL;
+  char miss_name[MAX_PATH_LEN];
+  
+  if (pathpa[0] == '/') {
+    parent = vfs_root_dentry;
+  } else {
+    parent = current->pfiles->cwd;
+  }
+  
+  char resolved_path[MAX_PATH_LEN];
+  resolve_path(pathpa, current->pfiles->cwd, resolved_path);
+  
+  struct dentry *target = lookup_final_dentry(resolved_path, &parent, miss_name);
+  if (!target) {
+    sprint("sys_user_ccwd: cannot find directory %s\n", pathpa);
+    return -1;
+  }
+  
+  if (target->dentry_inode->type != DIR_I) {
+    sprint("sys_user_ccwd: %s is not a directory\n", pathpa);
+    return -1;
+  }
+  
+  current->pfiles->cwd = target;
+  return 0;
 }
 
 long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
   switch (a0) {
-    case SYS_user_print: return sys_user_print((const char*)a1, a2);
-    case SYS_user_exit: return sys_user_exit(a1);
-    case SYS_user_allocate_page: return sys_user_allocate_page();
-    case SYS_user_free_page: return sys_user_free_page(a1);
-    case SYS_user_fork: return sys_user_fork();
-    case SYS_user_yield: return sys_user_yield();
-    case SYS_user_open: return sys_user_open((char *)a1, a2);
-    case SYS_user_read: return sys_user_read(a1, (char *)a2, a3);
-    case SYS_user_write: return sys_user_write(a1, (char *)a2, a3);
-    case SYS_user_lseek: return sys_user_lseek(a1, a2, a3);
-    case SYS_user_stat: return sys_user_stat(a1, (struct istat *)a2);
-    case SYS_user_disk_stat: return sys_user_disk_stat(a1, (struct istat *)a2);
-    case SYS_user_close: return sys_user_close(a1);
-    case SYS_user_opendir: return sys_user_opendir((char *)a1);
-    case SYS_user_readdir: return sys_user_readdir(a1, (struct dir *)a2);
-    case SYS_user_mkdir: return sys_user_mkdir((char *)a1);
-    case SYS_user_closedir: return sys_user_closedir(a1);
-    case SYS_user_link: return sys_user_link((char *)a1, (char *)a2);
-    case SYS_user_unlink: return sys_user_unlink((char *)a1);
-    case SYS_user_rcwd: return sys_user_rcwd((char *)a1);
-    case SYS_user_ccwd: return sys_user_ccwd((char *)a1);
-    default: panic("Unknown syscall %ld \n", a0);
+    case SYS_user_print:
+      return sys_user_print((const char*)a1, a2);
+    case SYS_user_exit:
+      return sys_user_exit(a1);
+    case SYS_user_allocate_page:
+      return sys_user_allocate_page();
+    case SYS_user_free_page:
+      return sys_user_free_page(a1);
+    case SYS_user_fork:
+      return sys_user_fork();
+    case SYS_user_yield:
+      return sys_user_yield();
+    case SYS_user_open:
+      return sys_user_open((char *)a1, a2);
+    case SYS_user_read:
+      return sys_user_read(a1, (char *)a2, a3);
+    case SYS_user_write:
+      return sys_user_write(a1, (char *)a2, a3);
+    case SYS_user_lseek:
+      return sys_user_lseek(a1, a2, a3);
+    case SYS_user_stat:
+      return sys_user_stat(a1, (struct istat *)a2);
+    case SYS_user_disk_stat:
+      return sys_user_disk_stat(a1, (struct istat *)a2);
+    case SYS_user_close:
+      return sys_user_close(a1);
+    case SYS_user_opendir:
+      return sys_user_opendir((char *)a1);
+    case SYS_user_readdir:
+      return sys_user_readdir(a1, (struct dir *)a2);
+    case SYS_user_mkdir:
+      return sys_user_mkdir((char *)a1);
+    case SYS_user_closedir:
+      return sys_user_closedir(a1);
+    case SYS_user_link:
+      return sys_user_link((char *)a1, (char *)a2);
+    case SYS_user_unlink:
+      return sys_user_unlink((char *)a1);
+    case SYS_user_rcwd:
+      return sys_user_rcwd((char *)a1);
+    case SYS_user_ccwd:
+      return sys_user_ccwd((char *)a1);
+    default:
+      panic("Unknown syscall %ld \n", a0);
   }
 }
 ```
 
-- 用以下代码替换 `syscall.h`
+- 用以下代码替换`syscall.h`
 
 ```c
 #ifndef _SYSCALL_H_
@@ -6465,5 +5735,1681 @@ long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, l
 long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7);
 
 #endif
+```
+
+- 用以下代码替换`vfs.c`
+
+```c
+#include "vfs.h"
+
+#include "pmm.h"
+#include "spike_interface/spike_utils.h"
+#include "util/string.h"
+#include "util/types.h"
+#include "util/hash_table.h"
+#include "process.h"
+
+struct dentry *vfs_root_dentry;
+struct super_block *vfs_sb_list[MAX_MOUNTS];
+struct device *vfs_dev_list[MAX_VFS_DEV];
+struct hash_table dentry_hash_table;
+struct hash_table vinode_hash_table;
+
+int vfs_init() {
+  int ret;
+  ret = hash_table_init(&dentry_hash_table, dentry_hash_equal, dentry_hash_func,
+                            NULL, NULL, NULL);
+  if (ret != 0) return ret;
+
+  ret = hash_table_init(&vinode_hash_table, vinode_hash_equal, vinode_hash_func,
+                            NULL, NULL, NULL);
+  if (ret != 0) return ret;
+  return 0; 
+}
+
+struct super_block *vfs_mount(const char *dev_name, int mnt_type) {
+  struct device *p_device = NULL;
+
+  for (int i = 0; i < MAX_VFS_DEV; ++i) {
+    p_device = vfs_dev_list[i];
+    if (p_device && strcmp(p_device->dev_name, dev_name) == 0) break;
+  }
+  if (p_device == NULL) panic("vfs_mount: cannot find the device entry!\n");
+
+  struct file_system_type *fs_type = p_device->fs_type;
+  struct super_block *sb = fs_type->get_superblock(p_device);
+
+  hash_put_vinode(sb->s_root->dentry_inode);
+
+  int err = 1;
+  for (int i = 0; i < MAX_MOUNTS; ++i) {
+    if (vfs_sb_list[i] == NULL) {
+      vfs_sb_list[i] = sb;
+      err = 0;
+      break;
+    }
+  }
+  if (err) panic("vfs_mount: too many mounts!\n");
+
+  if (mnt_type == MOUNT_AS_ROOT) {
+    vfs_root_dentry = sb->s_root;
+    hash_put_dentry(sb->s_root);
+  } else if (mnt_type == MOUNT_DEFAULT) {
+    if (!vfs_root_dentry)
+      panic("vfs_mount: root dentry not found, please mount the root device first!\n");
+
+    struct dentry *mnt_point = sb->s_root;
+    char *dev_name = p_device->dev_name;
+    strcpy(mnt_point->name, dev_name);
+    mnt_point->parent = vfs_root_dentry;
+    hash_put_dentry(sb->s_root);
+  } else {
+    panic("vfs_mount: unknown mount type!\n");
+  }
+
+  return sb;
+}
+
+void resolve_path(const char *path, struct dentry *cwd, char *resolved) {
+  char path_copy[MAX_PATH_LEN];
+  strcpy(path_copy, path);
+  
+  if (path[0] == '/') {
+    strcpy(resolved, path);
+    return;
+  }
+  
+  char cwd_path[MAX_PATH_LEN] = {0};
+  struct dentry *d = cwd;
+  char temp_path[MAX_PATH_LEN] = {0};
+  
+  if (d == vfs_root_dentry) {
+    strcpy(cwd_path, "/");
+  } else {
+    while (d && d != vfs_root_dentry) {
+      char temp[MAX_PATH_LEN];
+      strcpy(temp, "/");
+      strcat(temp, d->name);
+      strcat(temp, temp_path);
+      strcpy(temp_path, temp);
+      d = d->parent;
+    }
+    strcpy(cwd_path, temp_path);
+  }
+  
+  if (strcmp(cwd_path, "/") == 0) {
+    strcpy(resolved, "/");
+    strcat(resolved, path_copy);
+  } else {
+    strcpy(resolved, cwd_path);
+    strcat(resolved, "/");
+    strcat(resolved, path_copy);
+  }
+  
+  char *token = strtok(resolved, "/");
+  char components[MAX_PATH_LEN][MAX_PATH_LEN];
+  int comp_count = 0;
+  
+  while (token != NULL) {
+    if (strcmp(token, ".") == 0) {
+    } else if (strcmp(token, "..") == 0) {
+      if (comp_count > 0) {
+        comp_count--;
+      }
+    } else {
+      strcpy(components[comp_count++], token);
+    }
+    token = strtok(NULL, "/");
+  }
+  
+  strcpy(resolved, "/");
+  for (int i = 0; i < comp_count; i++) {
+    if (i > 0 || comp_count > 0) {
+      strcat(resolved, "/");
+    }
+    strcat(resolved, components[i]);
+  }
+  
+  if (comp_count == 0) {
+    strcpy(resolved, "/");
+  }
+}
+
+struct file *vfs_open(const char *path, int flags) {
+  struct dentry *parent = NULL;
+  char miss_name[MAX_PATH_LEN];
+  
+  if (path[0] == '/') {
+    parent = vfs_root_dentry;
+  } else {
+    if (current && current->pfiles) {
+      parent = current->pfiles->cwd;
+    } else {
+      parent = vfs_root_dentry;
+    }
+  }
+  
+  char resolved_path[MAX_PATH_LEN];
+  if (path[0] != '/') {
+    resolve_path(path, parent, resolved_path);
+  } else {
+    strcpy(resolved_path, path);
+  }
+  
+  struct dentry *file_dentry = lookup_final_dentry(resolved_path, &parent, miss_name);
+  
+  if (!file_dentry) {
+    int creatable = flags & O_CREAT;
+    if (creatable) {
+      char basename[MAX_PATH_LEN];
+      get_base_name(resolved_path, basename);
+      
+      if (strcmp(miss_name, basename) != 0) {
+        sprint("vfs_open: cannot create file in a non-exist directory!\n");
+        return NULL;
+      }
+      
+      file_dentry = alloc_vfs_dentry(basename, NULL, parent);
+      struct vinode *new_inode = viop_create(parent->dentry_inode, file_dentry);
+      if (!new_inode) panic("vfs_open: cannot create file!\n");
+      
+      file_dentry->dentry_inode = new_inode;
+      new_inode->ref++;
+      hash_put_dentry(file_dentry);
+      hash_put_vinode(new_inode);
+    } else {
+      sprint("vfs_open: cannot find the file!\n");
+      return NULL;
+    }
+  }
+  
+  if (file_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_open: cannot open a directory!\n");
+    return NULL;
+  }
+  
+  int writable = 0;
+  int readable = 0;
+  switch (flags & MASK_FILEMODE) {
+    case O_RDONLY:
+      writable = 0;
+      readable = 1;
+      break;
+    case O_WRONLY:
+      writable = 1;
+      readable = 0;
+      break;
+    case O_RDWR:
+      writable = 1;
+      readable = 1;
+      break;
+    default:
+      panic("fs_open: invalid open flags!\n");
+  }
+  
+  struct file *file = alloc_vfs_file(file_dentry, readable, writable, 0);
+  
+  if (file_dentry->dentry_inode->i_ops->viop_hook_open) {
+    if (file_dentry->dentry_inode->i_ops->
+        viop_hook_open(file_dentry->dentry_inode, file_dentry) < 0) {
+      sprint("vfs_open: hook_open failed!\n");
+    }
+  }
+  
+  return file;
+}
+
+ssize_t vfs_read(struct file *file, char *buf, size_t count) {
+  if (!file->readable) {
+    sprint("vfs_read: file is not readable!\n");
+    return -1;
+  }
+  if (file->f_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_read: cannot read a directory!\n");
+    return -1;
+  }
+  return viop_read(file->f_dentry->dentry_inode, buf, count, &(file->offset));
+}
+
+ssize_t vfs_write(struct file *file, const char *buf, size_t count) {
+  if (!file->writable) {
+    sprint("vfs_write: file is not writable!\n");
+    return -1;
+  }
+  if (file->f_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_read: cannot write a directory!\n");
+    return -1;
+  }
+  return viop_write(file->f_dentry->dentry_inode, buf, count, &(file->offset));
+}
+
+ssize_t vfs_lseek(struct file *file, ssize_t offset, int whence) {
+  if (file->f_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_read: cannot seek a directory!\n");
+    return -1;
+  }
+
+  if (viop_lseek(file->f_dentry->dentry_inode, offset, whence, &(file->offset)) != 0) {
+    sprint("vfs_lseek: lseek failed!\n");
+    return -1;
+  }
+
+  return file->offset;
+}
+
+int vfs_stat(struct file *file, struct istat *istat) {
+  istat->st_inum = file->f_dentry->dentry_inode->inum;
+  istat->st_size = file->f_dentry->dentry_inode->size;
+  istat->st_type = file->f_dentry->dentry_inode->type;
+  istat->st_nlinks = file->f_dentry->dentry_inode->nlinks;
+  istat->st_blocks = file->f_dentry->dentry_inode->blocks;
+  return 0;
+}
+
+int vfs_disk_stat(struct file *file, struct istat *istat) {
+  return viop_disk_stat(file->f_dentry->dentry_inode, istat);
+}
+
+int vfs_link(const char *oldpath, const char *newpath) {
+  struct dentry *parent = vfs_root_dentry;
+  char miss_name[MAX_PATH_LEN];
+
+  struct dentry *old_file_dentry =
+      lookup_final_dentry(oldpath, &parent, miss_name);
+  if (!old_file_dentry) {
+    sprint("vfs_link: cannot find the file!\n");
+    return -1;
+  }
+
+  if (old_file_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_link: cannot link a directory!\n");
+    return -1;
+  }
+
+  parent = vfs_root_dentry;
+  struct dentry *new_file_dentry =
+      lookup_final_dentry(newpath, &parent, miss_name);
+  if (new_file_dentry) {
+    sprint("vfs_link: the new file already exists!\n");
+    return -1;
+  }
+
+  char basename[MAX_PATH_LEN];
+  get_base_name(newpath, basename);
+  if (strcmp(miss_name, basename) != 0) {
+    sprint("vfs_link: cannot create file in a non-exist directory!\n");
+    return -1;
+  }
+
+  new_file_dentry = alloc_vfs_dentry(basename, old_file_dentry->dentry_inode, parent);
+  int err =
+      viop_link(parent->dentry_inode, new_file_dentry, old_file_dentry->dentry_inode);
+  if (err) return -1;
+
+  hash_put_dentry(new_file_dentry);
+
+  return 0;
+}
+
+int vfs_unlink(const char *path) {
+  struct dentry *parent = vfs_root_dentry;
+  char miss_name[MAX_PATH_LEN];
+
+  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
+  if (!file_dentry) {
+    sprint("vfs_unlink: cannot find the file!\n");
+    return -1;
+  }
+
+  if (file_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_unlink: cannot unlink a directory!\n");
+    return -1;
+  }
+
+  if (file_dentry->d_ref > 0) {
+    sprint("vfs_unlink: the file is still opened!\n");
+    return -1;
+  }
+
+  struct vinode *unlinked_vinode = file_dentry->dentry_inode;
+  int err = viop_unlink(parent->dentry_inode, file_dentry, unlinked_vinode);
+  if (err) return -1;
+
+  hash_erase_dentry(file_dentry);
+  free_vfs_dentry(file_dentry);
+  unlinked_vinode->ref--; 
+
+  if (unlinked_vinode->nlinks == 0) {
+    assert(unlinked_vinode->ref == 0);
+    hash_erase_vinode(unlinked_vinode);
+    free_page(unlinked_vinode);
+  }
+
+  return 0;
+}
+
+int vfs_close(struct file *file) {
+  if (file->f_dentry->dentry_inode->type != FILE_I) {
+    sprint("vfs_close: cannot close a directory!\n");
+    return -1;
+  }
+
+  struct dentry *dentry = file->f_dentry;
+  struct vinode *inode = dentry->dentry_inode;
+
+  if (inode->i_ops->viop_hook_close) {
+    if (inode->i_ops->viop_hook_close(inode, dentry) != 0) {
+      sprint("vfs_close: hook_close failed!\n");
+    }
+  }
+
+  dentry->d_ref--;
+  if (dentry->d_ref == 0) {
+    hash_erase_dentry(dentry);
+    free_vfs_dentry(dentry);
+    inode->ref--;
+    if (inode->ref == 0) {
+      if (viop_write_back_vinode(inode) != 0)
+        panic("vfs_close: free inode failed!\n");
+      hash_erase_vinode(inode);
+      free_page(inode);
+    }
+  }
+
+  file->status = FD_NONE;
+  return 0;
+}
+
+struct file *vfs_opendir(const char *path) {
+  struct dentry *parent = NULL;
+  char miss_name[MAX_PATH_LEN];
+  
+  if (path[0] == '/') {
+    parent = vfs_root_dentry;
+  } else {
+    if (current && current->pfiles) {
+      parent = current->pfiles->cwd;
+    } else {
+      parent = vfs_root_dentry;
+    }
+  }
+  
+  char resolved_path[MAX_PATH_LEN];
+  if (path[0] != '/') {
+    resolve_path(path, parent, resolved_path);
+  } else {
+    strcpy(resolved_path, path);
+  }
+  
+  struct dentry *file_dentry = lookup_final_dentry(resolved_path, &parent, miss_name);
+  if (!file_dentry || file_dentry->dentry_inode->type != DIR_I) {
+    sprint("vfs_opendir: cannot find the direntry!\n");
+    return NULL;
+  }
+
+  struct file *file = alloc_vfs_file(file_dentry, 1, 0, 0);
+
+  if (file_dentry->dentry_inode->i_ops->viop_hook_opendir) {
+    if (file_dentry->dentry_inode->i_ops->
+        viop_hook_opendir(file_dentry->dentry_inode, file_dentry) != 0) {
+      sprint("vfs_opendir: hook opendir failed!\n");
+    }
+  }
+
+  return file;
+}
+
+int vfs_readdir(struct file *file, struct dir *dir) {
+  if (file->f_dentry->dentry_inode->type != DIR_I) {
+    sprint("vfs_readdir: cannot read a file!\n");
+    return -1;
+  }
+  return viop_readdir(file->f_dentry->dentry_inode, dir, &(file->offset));
+}
+
+int vfs_mkdir(const char *path) {
+  struct dentry *parent = vfs_root_dentry;
+  char miss_name[MAX_PATH_LEN];
+
+  struct dentry *file_dentry = lookup_final_dentry(path, &parent, miss_name);
+  if (file_dentry) {
+    sprint("vfs_mkdir: the directory already exists!\n");
+    return -1;
+  }
+
+  char basename[MAX_PATH_LEN];
+  get_base_name(path, basename);
+  if (strcmp(miss_name, basename) != 0) {
+    sprint("vfs_mkdir: cannot create directory in a non-exist directory!\n");
+    return -1;
+  }
+
+  struct dentry *new_dentry = alloc_vfs_dentry(basename, NULL, parent);
+  struct vinode *new_dir_inode = viop_mkdir(parent->dentry_inode, new_dentry);
+  if (!new_dir_inode) {
+    free_page(new_dentry);
+    sprint("vfs_mkdir: cannot create directory!\n");
+    return -1;
+  }
+
+  new_dentry->dentry_inode = new_dir_inode;
+  new_dir_inode->ref++;
+  hash_put_dentry(new_dentry);
+  hash_put_vinode(new_dir_inode);
+  return 0;
+}
+
+int vfs_closedir(struct file *file) {
+  if (file->f_dentry->dentry_inode->type != DIR_I) {
+    sprint("vfs_closedir: cannot close a file!\n");
+    return -1;
+  }
+
+  file->f_dentry->d_ref--;
+  file->status = FD_NONE;
+
+  if (file->f_dentry->dentry_inode->i_ops->viop_hook_closedir) {
+    if (file->f_dentry->dentry_inode->i_ops->
+        viop_hook_closedir(file->f_dentry->dentry_inode, file->f_dentry) != 0) {
+      sprint("vfs_closedir: hook closedir failed!\n");
+    }
+  }
+  return 0;
+}
+
+struct dentry *lookup_final_dentry(const char *path, struct dentry **parent,
+                                   char *miss_name) {
+  char path_copy[MAX_PATH_LEN];
+  strcpy(path_copy, path);
+  
+  if (strlen(path_copy) == 0 || (strlen(path_copy) == 1 && path_copy[0] == '/')) {
+    *parent = vfs_root_dentry;
+    return vfs_root_dentry;
+  }
+  
+  if (path_copy[0] == '/') {
+    *parent = vfs_root_dentry;
+  }
+  
+  char *token = strtok(path_copy, "/");
+  struct dentry *this = *parent;
+  
+  while (token != NULL) {
+    *parent = this;
+    this = hash_get_dentry((*parent), token);
+    if (this == NULL) {
+      this = alloc_vfs_dentry(token, NULL, *parent);
+      struct vinode *found_vinode = viop_lookup((*parent)->dentry_inode, this);
+      if (found_vinode == NULL) {
+        free_page(this);
+        strcpy(miss_name, token);
+        return NULL;
+      }
+      
+      struct vinode *same_inode = hash_get_vinode(found_vinode->sb, found_vinode->inum);
+      if (same_inode != NULL) {
+        this->dentry_inode = same_inode;
+        same_inode->ref++;
+        free_page(found_vinode);
+      } else {
+        this->dentry_inode = found_vinode;
+        found_vinode->ref++;
+        hash_put_vinode(found_vinode);
+      }
+      
+      hash_put_dentry(this);
+    }
+    
+    token = strtok(NULL, "/");
+  }
+  return this;
+}
+
+void get_base_name(const char *path, char *base_name) {
+  char path_copy[MAX_PATH_LEN];
+  strcpy(path_copy, path);
+
+  char *token = strtok(path_copy, "/");
+  char *last_token = NULL;
+  while (token != NULL) {
+    last_token = token;
+    token = strtok(NULL, "/");
+  }
+
+  strcpy(base_name, last_token);
+}
+
+struct file *alloc_vfs_file(struct dentry *file_dentry, int readable, int writable,
+                        int offset) {
+  struct file *file = alloc_page();
+  file->f_dentry = file_dentry;
+  file_dentry->d_ref += 1;
+
+  file->readable = readable;
+  file->writable = writable;
+  file->offset = 0;
+  file->status = FD_OPENED;
+  return file;
+}
+
+struct dentry *alloc_vfs_dentry(const char *name, struct vinode *inode,
+                            struct dentry *parent) {
+  struct dentry *dentry = (struct dentry *)alloc_page();
+  strcpy(dentry->name, name);
+  dentry->dentry_inode = inode;
+  if (inode) inode->ref++;
+
+  dentry->parent = parent;
+  dentry->d_ref = 0;
+  return dentry;
+}
+
+int free_vfs_dentry(struct dentry *dentry) {
+  if (dentry->d_ref > 0) {
+    sprint("free_vfs_dentry: dentry is still in use!\n");
+    return -1;
+  }
+  free_page((void *)dentry);
+  return 0;
+}
+
+int dentry_hash_equal(void *key1, void *key2) {
+  struct dentry_key *dentry_key1 = key1;
+  struct dentry_key *dentry_key2 = key2;
+  if (strcmp(dentry_key1->name, dentry_key2->name) == 0 &&
+      dentry_key1->parent == dentry_key2->parent) {
+    return 1;
+  }
+  return 0;
+}
+
+size_t dentry_hash_func(void *key) {
+  struct dentry_key *dentry_key = key;
+  char *name = dentry_key->name;
+
+  size_t hash = 5381;
+  int c;
+
+  while ((c = *name++)) hash = ((hash << 5) + hash) + c;
+
+  hash = ((hash << 5) + hash) + (size_t)dentry_key->parent;
+  return hash % HASH_TABLE_SIZE;
+}
+
+struct dentry *hash_get_dentry(struct dentry *parent, char *name) {
+  struct dentry_key key = {.parent = parent, .name = name};
+  return (struct dentry *)dentry_hash_table.virtual_hash_get(&dentry_hash_table,
+                                                             &key);
+}
+
+int hash_put_dentry(struct dentry *dentry) {
+  struct dentry_key *key = alloc_page();
+  key->name = dentry->name;
+  key->parent = dentry->parent;
+
+  int ret = dentry_hash_table.virtual_hash_put(&dentry_hash_table, key, dentry);
+  if (ret != 0)
+    free_page(key);
+  return ret;
+}
+
+int hash_erase_dentry(struct dentry *dentry) {
+  struct dentry_key key = {.parent = dentry->parent, .name = dentry->name};
+  return dentry_hash_table.virtual_hash_erase(&dentry_hash_table, &key);
+}
+
+int vinode_hash_equal(void *key1, void *key2) {
+  struct vinode_key *vinode_key1 = key1;
+  struct vinode_key *vinode_key2 = key2;
+  if (vinode_key1->inum == vinode_key2->inum && vinode_key1->sb == vinode_key2->sb) {
+    return 1;
+  }
+  return 0;
+}
+
+size_t vinode_hash_func(void *key) {
+  struct vinode_key *vinode_key = key;
+  return vinode_key->inum % HASH_TABLE_SIZE;
+}
+
+struct vinode *hash_get_vinode(struct super_block *sb, int inum) {
+  if (inum < 0) return NULL;
+  struct vinode_key key = {.sb = sb, .inum = inum};
+  return (struct vinode *)vinode_hash_table.virtual_hash_get(&vinode_hash_table,
+                                                             &key);
+}
+
+int hash_put_vinode(struct vinode *vinode) {
+  if (vinode->inum < 0) return -1;
+  struct vinode_key *key = alloc_page();
+  key->sb = vinode->sb;
+  key->inum = vinode->inum;
+
+  int ret = vinode_hash_table.virtual_hash_put(&vinode_hash_table, key, vinode);
+  if (ret != 0) free_page(key);
+  return ret;
+}
+
+int hash_erase_vinode(struct vinode *vinode) {
+  if (vinode->inum < 0) return -1;
+  struct vinode_key key = {.sb = vinode->sb, .inum = vinode->inum};
+  return vinode_hash_table.virtual_hash_erase(&vinode_hash_table, &key);
+}
+
+struct vinode *default_alloc_vinode(struct super_block *sb) {
+  struct vinode *vinode = (struct vinode *)alloc_page();
+  vinode->blocks = 0;
+  vinode->inum = 0;
+  vinode->nlinks = 0;
+  vinode->ref = 0;
+  vinode->sb = sb;
+  vinode->size = 0;
+  return vinode;
+}
+
+struct file_system_type *fs_list[MAX_SUPPORTED_FS];
+```
+
+- 用以下代码替换`vfs.h`
+
+```c
+#ifndef _VFS_H_
+#define _VFS_H_
+
+#include "util/types.h"
+
+#define MAX_VFS_DEV 10
+#define MAX_DENTRY_NAME_LEN 30
+#define MAX_DEVICE_NAME_LEN 30
+#define MAX_MOUNTS 10
+#define MAX_DENTRY_HASH_SIZE 100
+#define MAX_PATH_LEN 30
+#define MAX_SUPPORTED_FS 10
+
+#define DIRECT_BLKNUM 10
+
+int vfs_init();
+
+struct super_block *vfs_mount(const char *dev_name, int mnt_type);
+
+struct file *vfs_open(const char *path, int flags);
+ssize_t vfs_read(struct file *file, char *buf, size_t count);
+ssize_t vfs_write(struct file *file, const char *buf, size_t count);
+ssize_t vfs_lseek(struct file *file, ssize_t offset, int whence);
+int vfs_stat(struct file *file, struct istat *istat);
+int vfs_disk_stat(struct file *file, struct istat *istat);
+int vfs_link(const char *oldpath, const char *newpath);
+int vfs_unlink(const char *path);
+int vfs_close(struct file *file);
+
+struct file *vfs_opendir(const char *path);
+int vfs_readdir(struct file *file, struct dir *dir);
+int vfs_mkdir(const char *path);
+int vfs_closedir(struct file *file);
+
+extern struct dentry *vfs_root_dentry;
+
+struct dentry {
+  char name[MAX_DENTRY_NAME_LEN];
+  int d_ref;
+  struct vinode *dentry_inode;
+  struct dentry *parent;
+  struct super_block *sb;
+};
+
+struct dentry *alloc_vfs_dentry(const char *name, struct vinode *inode,
+                            struct dentry *parent);
+int free_vfs_dentry(struct dentry *dentry);
+
+extern struct hash_table dentry_hash_table;
+
+struct dentry_key {
+  struct dentry *parent;
+  char *name;
+};
+
+int dentry_hash_equal(void *key1, void *key2);
+size_t dentry_hash_func(void *key);
+
+struct dentry *hash_get_dentry(struct dentry *parent, char *name);
+int hash_put_dentry(struct dentry *dentry);
+int hash_erase_dentry(struct dentry *dentry);
+
+struct file {
+  int status;
+  int readable;
+  int writable;
+  int offset;
+  struct dentry *f_dentry;
+};
+
+struct file *alloc_vfs_file(struct dentry *dentry, int readable, int writable,
+                        int offset);
+
+struct device {
+  char dev_name[MAX_DEVICE_NAME_LEN];
+  int dev_id;
+  struct file_system_type *fs_type;
+};
+
+extern struct device *vfs_dev_list[MAX_VFS_DEV];
+
+struct file_system_type {
+  int type_num;
+  struct super_block *(*get_superblock)(struct device *dev);
+};
+
+extern struct file_system_type *fs_list[MAX_SUPPORTED_FS];
+
+struct super_block {
+  int magic;
+  int size;
+  int nblocks;
+  int ninodes;
+  struct dentry *s_root;
+  struct device *s_dev;
+  void *s_fs_info;
+};
+
+struct vinode {
+  int inum;
+  int ref;
+  int size;
+  int type;
+  int nlinks;
+  int blocks;
+  int addrs[DIRECT_BLKNUM];
+  void *i_fs_info;
+  struct super_block *sb;
+  const struct vinode_ops *i_ops;
+};
+
+struct vinode_ops {
+  ssize_t (*viop_read)(struct vinode *node, char *buf, ssize_t len,
+                       int *offset);
+  ssize_t (*viop_write)(struct vinode *node, const char *buf, ssize_t len,
+                        int *offset);
+  struct vinode *(*viop_create)(struct vinode *parent, struct dentry *sub_dentry);
+  int (*viop_lseek)(struct vinode *node, ssize_t new_off, int whence, int *off);
+  int (*viop_disk_stat)(struct vinode *node, struct istat *istat);
+  int (*viop_link)(struct vinode *parent, struct dentry *sub_dentry,
+                   struct vinode *link_node);
+  int (*viop_unlink)(struct vinode *parent, struct dentry *sub_dentry,
+                     struct vinode *unlink_node);
+  struct vinode *(*viop_lookup)(struct vinode *parent,
+                                struct dentry *sub_dentry);
+  int (*viop_readdir)(struct vinode *dir_vinode, struct dir *dir, int *offset);
+  struct vinode *(*viop_mkdir)(struct vinode *parent, struct dentry *sub_dentry);
+  int (*viop_write_back_vinode)(struct vinode *node);
+  int (*viop_hook_open)(struct vinode *node, struct dentry *dentry);
+  int (*viop_hook_close)(struct vinode *node, struct dentry *dentry);
+  int (*viop_hook_opendir)(struct vinode *node, struct dentry *dentry);
+  int (*viop_hook_closedir)(struct vinode *node, struct dentry *dentry);
+};
+
+#define viop_read(node, buf, len, offset)      (node->i_ops->viop_read(node, buf, len, offset))
+#define viop_write(node, buf, len, offset)     (node->i_ops->viop_write(node, buf, len, offset))
+#define viop_create(node, name)                (node->i_ops->viop_create(node, name))
+#define viop_lseek(node, new_off, whence, off) (node->i_ops->viop_lseek(node, new_off, whence, off))
+#define viop_disk_stat(node, istat)            (node->i_ops->viop_disk_stat(node, istat))
+#define viop_link(node, name, link_node)       (node->i_ops->viop_link(node, name, link_node))
+#define viop_unlink(node, name, unlink_node)   (node->i_ops->viop_unlink(node, name, unlink_node))
+#define viop_lookup(parent, sub_dentry)        (parent->i_ops->viop_lookup(parent, sub_dentry))
+#define viop_readdir(dir_vinode, dir, offset)  (dir_vinode->i_ops->viop_readdir(dir_vinode, dir, offset))
+#define viop_mkdir(dir, sub_dentry)            (dir->i_ops->viop_mkdir(dir, sub_dentry))
+#define viop_write_back_vinode(node)           (node->i_ops->viop_write_back_vinode(node))
+
+extern struct hash_table vinode_hash_table;
+
+struct vinode_key {
+  int inum;
+  struct super_block *sb;
+};
+
+int vinode_hash_equal(void *key1, void *key2);
+size_t vinode_hash_func(void *key);
+
+struct vinode *hash_get_vinode(struct super_block *sb, int inum);
+int hash_put_vinode(struct vinode *vinode);
+int hash_erase_vinode(struct vinode *vinode);
+
+struct vinode *default_alloc_vinode(struct super_block *sb);
+struct dentry *lookup_final_dentry(const char *path, struct dentry **parent,
+                                   char *miss_name);
+void get_base_name(const char *path, char *base_name);
+void resolve_path(const char *path, struct dentry *cwd, char *resolved);
+
+#endif
+```
+
+- 用以下代码替换`rfs.c`
+
+```c
+#include "rfs.h"
+
+#include "pmm.h"
+#include "ramdev.h"
+#include "spike_interface/spike_utils.h"
+#include "util/string.h"
+#include "vfs.h"
+
+const struct vinode_ops rfs_i_ops = {
+    .viop_read = rfs_read,
+    .viop_write = rfs_write,
+    .viop_create = rfs_create,
+    .viop_lseek = rfs_lseek,
+    .viop_disk_stat = rfs_disk_stat,
+    .viop_link = rfs_link,
+    .viop_unlink = rfs_unlink,
+    .viop_lookup = rfs_lookup,
+
+    .viop_readdir = rfs_readdir,
+    .viop_mkdir = rfs_mkdir,
+
+    .viop_write_back_vinode = rfs_write_back_vinode,
+
+    .viop_hook_opendir = rfs_hook_opendir,
+    .viop_hook_closedir = rfs_hook_closedir,
+};
+
+int register_rfs() {
+  struct file_system_type *fs_type = (struct file_system_type *)alloc_page();
+  fs_type->type_num = RFS_TYPE;
+  fs_type->get_superblock = rfs_get_superblock;
+
+  for (int i = 0; i < MAX_SUPPORTED_FS; i++) {
+    if (fs_list[i] == NULL) {
+      fs_list[i] = fs_type;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int rfs_format_dev(struct device *dev) {
+  struct rfs_device *rdev = rfs_device_list[dev->dev_id];
+
+  struct super_block *super = (struct super_block *)rdev->iobuffer;
+  super->magic = RFS_MAGIC;
+  super->size =
+      1 + RFS_MAX_INODE_BLKNUM + 1 + RFS_MAX_INODE_BLKNUM * RFS_DIRECT_BLKNUM;
+  super->nblocks = RFS_MAX_INODE_BLKNUM * RFS_DIRECT_BLKNUM;
+  super->ninodes = RFS_BLKSIZE / RFS_INODESIZE * RFS_MAX_INODE_BLKNUM;
+
+  if (rfs_w1block(rdev, RFS_BLK_OFFSET_SUPER) != 0)
+    panic("RFS: failed to write superblock!\n");
+
+  struct rfs_dinode *p_dinode = (struct rfs_dinode *)rdev->iobuffer;
+  for (int i = 0; i < RFS_BLKSIZE / RFS_INODESIZE; ++i) {
+    p_dinode->size = 0;
+    p_dinode->type = R_FREE;
+    p_dinode->nlinks = 0;
+    p_dinode->blocks = 0;
+    p_dinode = (struct rfs_dinode *)((char *)p_dinode + RFS_INODESIZE);
+  }
+
+  for (int inode_block = 0; inode_block < RFS_MAX_INODE_BLKNUM; ++inode_block) {
+    if (rfs_w1block(rdev, RFS_BLK_OFFSET_INODE + inode_block) != 0)
+      panic("RFS: failed to initialize empty inodes!\n");
+  }
+
+  struct rfs_dinode root_dinode;
+  root_dinode.size = 0;
+  root_dinode.type = R_DIR;
+  root_dinode.nlinks = 1;
+  root_dinode.blocks = 1;
+  root_dinode.addrs[0] = RFS_BLK_OFFSET_FREE;
+
+  if (rfs_write_dinode(rdev, &root_dinode, 0) != 0) {
+    sprint("RFS: failed to write root inode!\n");
+    return -1;
+  }
+
+  int *freemap = (int *)rdev->iobuffer;
+  memset(freemap, 0, RFS_BLKSIZE);
+  freemap[0] = 1;
+
+  if (rfs_w1block(rdev, RFS_BLK_OFFSET_BITMAP) != 0) {
+    sprint("RFS: failed to write bitmap!\n");
+    return -1;
+  }
+
+  sprint("RFS: format %s done!\n", dev->dev_name);
+  return 0;
+}
+
+int rfs_r1block(struct rfs_device *rfs_dev, int n_block) {
+  return dop_read(rfs_dev, n_block);
+}
+
+int rfs_w1block(struct rfs_device *rfs_dev, int n_block) {
+  return dop_write(rfs_dev, n_block);
+}
+
+struct rfs_dinode *rfs_read_dinode(struct rfs_device *rdev, int n_inode) {
+  int n_block = n_inode / (RFS_BLKSIZE / RFS_INODESIZE) + RFS_BLK_OFFSET_INODE;
+  int offset = n_inode % (RFS_BLKSIZE / RFS_INODESIZE);
+
+  if (dop_read(rdev, n_block) != 0) return NULL;
+  struct rfs_dinode *dinode = (struct rfs_dinode *)alloc_page();
+  memcpy(dinode, (char *)rdev->iobuffer + offset * RFS_INODESIZE,
+         sizeof(struct rfs_dinode));
+  return dinode;
+}
+
+int rfs_write_dinode(struct rfs_device *rdev, const struct rfs_dinode *dinode,
+                     int n_inode) {
+  int n_block = n_inode / (RFS_BLKSIZE / RFS_INODESIZE) + RFS_BLK_OFFSET_INODE;
+  int offset = n_inode % (RFS_BLKSIZE / RFS_INODESIZE);
+
+  dop_read(rdev, n_block);
+  memcpy(rdev->iobuffer + offset * RFS_INODESIZE, dinode,
+         sizeof(struct rfs_dinode));
+  int ret = dop_write(rdev, n_block);
+
+  return ret;
+}
+
+int rfs_alloc_block(struct super_block *sb) {
+  int free_block = -1;
+  int *freemap = (int *)sb->s_fs_info;
+  for (int block = 0; block < sb->nblocks; ++block) {
+    if (freemap[block] == 0) {
+      freemap[block] = 1;
+      free_block = RFS_BLK_OFFSET_FREE + block;
+      break;
+    }
+  }
+  if (free_block == -1) panic("rfs_alloc_block: no more free block!\n");
+  return free_block;
+}
+
+int rfs_free_block(struct super_block *sb, int block_num) {
+  int *freemap = (int *)sb->s_fs_info;
+  freemap[block_num - RFS_BLK_OFFSET_FREE] = 0;
+  return 0;
+}
+
+int rfs_add_direntry(struct vinode *dir, const char *name, int inum) {
+  struct rfs_device *rdev = rfs_device_list[dir->sb->s_dev->dev_id];
+  int n_block = dir->addrs[dir->size / RFS_BLKSIZE];
+  if (rfs_r1block(rdev, n_block) != 0) {
+    return -1;
+  }
+
+  char *addr = (char *)rdev->iobuffer + dir->size % RFS_BLKSIZE;
+  struct rfs_direntry *p_direntry = (struct rfs_direntry *)addr;
+  p_direntry->inum = inum;
+  strcpy(p_direntry->name, name);
+
+  if (rfs_w1block(rdev, n_block) != 0) {
+    return -1;
+  }
+
+  dir->size += sizeof(struct rfs_direntry);
+
+  if (rfs_write_back_vinode(dir) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+struct vinode *rfs_alloc_vinode(struct super_block *sb) {
+  struct vinode *vinode = default_alloc_vinode(sb);
+  vinode->i_ops = &rfs_i_ops;
+  return vinode;
+}
+
+int rfs_write_back_vinode(struct vinode *vinode) {
+  struct rfs_dinode dinode;
+  dinode.size = vinode->size;
+  dinode.nlinks = vinode->nlinks;
+  dinode.blocks = vinode->blocks;
+  dinode.type = vinode->type;
+  for (int i = 0; i < RFS_DIRECT_BLKNUM; ++i) {
+    dinode.addrs[i] = vinode->addrs[i];
+  }
+
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  if (rfs_write_dinode(rdev, &dinode, vinode->inum) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int rfs_update_vinode(struct vinode *vinode) {
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  struct rfs_dinode *dinode = rfs_read_dinode(rdev, vinode->inum);
+  if (dinode == NULL) {
+    return -1;
+  }
+  vinode->size = dinode->size;
+  vinode->nlinks = dinode->nlinks;
+  vinode->blocks = dinode->blocks;
+  vinode->type = dinode->type;
+  for (int i = 0; i < RFS_DIRECT_BLKNUM; ++i) {
+    vinode->addrs[i] = dinode->addrs[i];
+  }
+  free_page(dinode);
+
+  return 0;
+}
+
+ssize_t rfs_read(struct vinode *f_inode, char *r_buf, ssize_t len,
+                 int *offset) {
+  if (f_inode->size < (*offset + len)) len = f_inode->size - *offset;
+
+  char buffer[len + 1];
+
+  int align = *offset % RFS_BLKSIZE;
+  int block_offset = *offset / RFS_BLKSIZE;
+  int buf_offset = 0;
+
+  int readtimes = (align + len) / RFS_BLKSIZE;
+  int remain = (align + len) % RFS_BLKSIZE;
+
+  struct rfs_device *rdev = rfs_device_list[f_inode->sb->s_dev->dev_id];
+
+  rfs_r1block(rdev, f_inode->addrs[block_offset]);
+  int first_block_len = (readtimes == 0 ? len : RFS_BLKSIZE - align);
+  memcpy(buffer + buf_offset, rdev->iobuffer + align, first_block_len);
+  buf_offset += first_block_len;
+  block_offset++;
+  readtimes--;
+
+  if (readtimes >= 0) {
+    while (readtimes != 0) {
+      rfs_r1block(rdev, f_inode->addrs[block_offset]);
+      memcpy(buffer + buf_offset, rdev->iobuffer, RFS_BLKSIZE);
+      buf_offset += RFS_BLKSIZE;
+      block_offset++;
+      readtimes--;
+    }
+
+    if (remain > 0) {
+      rfs_r1block(rdev, f_inode->addrs[block_offset]);
+      memcpy(buffer + buf_offset, rdev->iobuffer, remain);
+    }
+  }
+
+  buffer[len] = '\0';
+  strcpy(r_buf, buffer);
+
+  *offset += len;
+  return len;
+}
+
+ssize_t rfs_write(struct vinode *f_inode, const char *w_buf, ssize_t len,
+                  int *offset) {
+  int align = *offset % RFS_BLKSIZE;
+  int writetimes = (len + align) / RFS_BLKSIZE;
+  int remain = (len + align) % RFS_BLKSIZE;
+
+  int buf_offset = 0;
+  int block_offset = *offset / RFS_BLKSIZE;
+
+  struct rfs_device *rdev = rfs_device_list[f_inode->sb->s_dev->dev_id];
+
+  if (align != 0) {
+    rfs_r1block(rdev, f_inode->addrs[block_offset]);
+    int first_block_len = (writetimes == 0 ? len : RFS_BLKSIZE - align);
+    memcpy(rdev->iobuffer + align, w_buf, first_block_len);
+    rfs_w1block(rdev, f_inode->addrs[block_offset]);
+
+    buf_offset += first_block_len;
+    block_offset++;
+    writetimes--;
+  }
+
+  if (writetimes >= 0) {
+    while (writetimes != 0) {
+      if (block_offset == f_inode->blocks) {
+        f_inode->addrs[block_offset] = rfs_alloc_block(f_inode->sb);
+        f_inode->blocks++;
+      }
+
+      memcpy(rdev->iobuffer, w_buf + buf_offset, RFS_BLKSIZE);
+      rfs_w1block(rdev, f_inode->addrs[block_offset]);
+
+      buf_offset += RFS_BLKSIZE;
+      block_offset++;
+      writetimes--;
+    }
+
+    if (remain > 0) {
+      if (block_offset == f_inode->blocks) {
+        f_inode->addrs[block_offset] = rfs_alloc_block(f_inode->sb);
+        ++f_inode->blocks;
+      }
+      memcpy(rdev->iobuffer, w_buf + buf_offset, remain);
+      rfs_w1block(rdev, f_inode->addrs[block_offset]);
+    }
+  }
+
+  f_inode->size =
+      (f_inode->size < *offset + len ? *offset + len : f_inode->size);
+
+  *offset += len;
+  return len;
+}
+
+struct vinode *rfs_lookup(struct vinode *parent, struct dentry *sub_dentry) {
+  struct rfs_direntry *p_direntry = NULL;
+  struct vinode *child_vinode = NULL;
+
+  int total_direntrys = parent->size / sizeof(struct rfs_direntry);
+  int one_block_direntrys = RFS_BLKSIZE / sizeof(struct rfs_direntry);
+
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  for (int i = 0; i < total_direntrys; ++i) {
+    if (i % one_block_direntrys == 0) {
+      rfs_r1block(rdev, parent->addrs[i / one_block_direntrys]);
+      p_direntry = (struct rfs_direntry *)rdev->iobuffer;
+    }
+    if (strcmp(p_direntry->name, sub_dentry->name) == 0) {
+      child_vinode = rfs_alloc_vinode(parent->sb);
+      child_vinode->inum = p_direntry->inum;
+      rfs_update_vinode(child_vinode);
+      break;
+    }
+    ++p_direntry;
+  }
+  return child_vinode;
+}
+
+struct vinode *rfs_create(struct vinode *parent, struct dentry *sub_dentry) {
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  struct rfs_dinode *free_dinode = NULL;
+  int free_inum = 0;
+  for (int i = 0; i < (RFS_BLKSIZE / RFS_INODESIZE * RFS_MAX_INODE_BLKNUM);
+       ++i) {
+    free_dinode = rfs_read_dinode(rdev, i);
+    if (free_dinode->type == R_FREE) {
+      free_inum = i;
+      break;
+    }
+    free_page(free_dinode);
+  }
+
+  if (free_dinode == NULL)
+    panic("rfs_create: no more free disk inode, we cannot create file.\n" );
+
+  free_dinode->size = 0;
+  free_dinode->type = R_FILE;
+  free_dinode->nlinks = 1;
+  free_dinode->blocks = 0;
+
+  free_dinode->addrs[0] = rfs_alloc_block(parent->sb);
+
+  rfs_write_dinode(rdev, free_dinode, free_inum);
+  free_page(free_dinode);
+
+  struct vinode *new_vinode = rfs_alloc_vinode(parent->sb);
+  new_vinode->inum = free_inum;
+  rfs_update_vinode(new_vinode);
+
+  int result = rfs_add_direntry(parent, sub_dentry->name, free_inum);
+  if (result == -1) {
+    return NULL;
+  }
+
+  return new_vinode;
+}
+
+int rfs_lseek(struct vinode *f_inode, ssize_t new_offset, int whence, int *offset) {
+  int file_size = f_inode->size;
+
+  switch (whence) {
+    case LSEEK_SET:
+      if (new_offset < 0 || new_offset > file_size) {
+        return -1;
+      }
+      *offset = new_offset;
+      break;
+    case LSEEK_CUR:
+      if (*offset + new_offset < 0 || *offset + new_offset > file_size) {
+        return -1;
+      }
+      *offset += new_offset;
+      break;
+    default:
+      return -1;
+  }
+  
+  return 0;
+}
+
+int rfs_disk_stat(struct vinode *vinode, struct istat *istat) {
+  struct rfs_device *rdev = rfs_device_list[vinode->sb->s_dev->dev_id];
+  struct rfs_dinode *dinode = rfs_read_dinode(rdev, vinode->inum);
+  if (dinode == NULL) {
+    return -1;
+  }
+
+  istat->st_inum = vinode->inum;
+  istat->st_size = dinode->size;
+  istat->st_type = dinode->type;
+  istat->st_nlinks = dinode->nlinks;
+  istat->st_blocks = dinode->blocks;
+  free_page(dinode);
+  return 0;
+}
+
+int rfs_link(struct vinode *parent, struct dentry *sub_dentry, struct vinode *link_node) {
+  link_node->nlinks++;
+  int result = rfs_add_direntry(parent, sub_dentry->name, link_node->inum);
+  if (result == -1) {
+    link_node->nlinks--;
+    return -1;
+  }
+  return rfs_write_back_vinode(link_node);
+}
+
+int rfs_unlink(struct vinode *parent, struct dentry *sub_dentry, struct vinode *unlink_vinode) {
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  int total_direntrys = parent->size / sizeof(struct rfs_direntry);
+  int one_block_direntrys = RFS_BLKSIZE / sizeof(struct rfs_direntry);
+
+  struct rfs_direntry *p_direntry = NULL;
+  int delete_index;
+  for (delete_index = 0; delete_index < total_direntrys; ++delete_index) {
+    if (delete_index % one_block_direntrys == 0) {
+      rfs_r1block(rdev, parent->addrs[delete_index / one_block_direntrys]);
+      p_direntry = (struct rfs_direntry *)rdev->iobuffer;
+    }
+    if (strcmp(p_direntry->name, sub_dentry->name) == 0) {
+      break;
+    }
+    ++p_direntry;
+  }
+
+  int inum = p_direntry->inum;
+
+  if (delete_index == total_direntrys) {
+    return -1;
+  }
+
+  struct rfs_dinode *unlink_dinode = rfs_read_dinode(rdev, inum);
+  assert(unlink_vinode->nlinks == unlink_dinode->nlinks);
+
+  unlink_vinode->nlinks--;
+  unlink_dinode->nlinks = unlink_vinode->nlinks;
+
+  if (unlink_dinode->nlinks == 0) {
+    for (int i = 0; i < unlink_dinode->blocks; ++i) {
+      rfs_free_block(parent->sb, unlink_dinode->addrs[i]);
+    }
+    unlink_dinode->type = R_FREE;
+  }
+  rfs_write_dinode(rdev, unlink_dinode, inum);
+  free_page(unlink_dinode);
+
+  int delete_block_index = delete_index / one_block_direntrys;
+  rfs_r1block(rdev, parent->addrs[delete_block_index]);
+
+  int offset = delete_index % one_block_direntrys;
+  memmove(rdev->iobuffer + offset * sizeof(struct rfs_direntry),
+          rdev->iobuffer + (offset + 1) * sizeof(struct rfs_direntry),
+          (one_block_direntrys - offset - 1) * sizeof(struct rfs_direntry));
+
+  struct rfs_direntry *previous_block = (struct rfs_direntry *)alloc_page();
+  memcpy(previous_block, rdev->iobuffer, RFS_BLKSIZE);
+
+  for (int i = delete_block_index + 1; i < parent->blocks; i++) {
+    rfs_r1block(rdev, parent->addrs[i]);
+    struct rfs_direntry *this_block = (struct rfs_direntry *)alloc_page();
+    memcpy(this_block, rdev->iobuffer, RFS_BLKSIZE);
+
+    memcpy(previous_block + one_block_direntrys - 1, rdev->iobuffer,
+           sizeof(struct rfs_direntry));
+
+    memmove(this_block, this_block + 1,
+            (one_block_direntrys - 1) * sizeof(struct rfs_direntry));
+
+    memcpy(rdev->iobuffer, previous_block, RFS_BLKSIZE);
+    rfs_w1block(rdev, parent->addrs[i - 1]);
+
+    free_page(previous_block);
+    previous_block = this_block;
+  }
+
+  memcpy(rdev->iobuffer, previous_block, RFS_BLKSIZE);
+  rfs_w1block(rdev, parent->addrs[parent->blocks - 1]);
+  free_page(previous_block);
+
+  total_direntrys--;
+  if (total_direntrys % one_block_direntrys == 0 && parent->blocks > 1) {
+    rfs_free_block(parent->sb, parent->addrs[parent->blocks - 1]);
+    parent->blocks--;
+  }
+
+  parent->size -= sizeof(struct rfs_direntry);
+
+  if (rfs_write_back_vinode(parent) != 0) {
+    return -1;
+  }
+
+  return 0;
+}
+
+int rfs_hook_opendir(struct vinode *dir_vinode, struct dentry *dentry) {
+  void *pdire = NULL;
+  void *previous = NULL;
+  struct rfs_device *rdev = rfs_device_list[dir_vinode->sb->s_dev->dev_id];
+
+  for (int i = dir_vinode->blocks - 1; i >= 0; i--) {
+    previous = pdire;
+    pdire = alloc_page();
+    if (previous != NULL && (char *)previous - (char *)pdire != RFS_BLKSIZE)
+      panic("rfs_hook_opendir: memory discontinuity");
+    rfs_r1block(rdev, dir_vinode->addrs[i]);
+    memcpy(pdire, rdev->iobuffer, RFS_BLKSIZE);
+  }
+
+  struct rfs_dir_cache *dir_cache = (struct rfs_dir_cache *)alloc_page();
+  dir_cache->block_count = dir_vinode->blocks;
+  dir_cache->dir_base_addr = (struct rfs_direntry *)pdire;
+  dir_vinode->i_fs_info = dir_cache;
+
+  return 0;
+}
+
+int rfs_hook_closedir(struct vinode *dir_vinode, struct dentry *dentry) {
+  struct rfs_dir_cache *dir_cache = (struct rfs_dir_cache *)dir_vinode->i_fs_info;
+  for (int i = 0; i < dir_cache->block_count; ++i) {
+    free_page((char *)dir_cache->dir_base_addr + i * RFS_BLKSIZE);
+  }
+  return 0;
+}
+
+int rfs_readdir(struct vinode *dir_vinode, struct dir *dir, int *offset) {
+  int total_direntrys = dir_vinode->size / sizeof(struct rfs_direntry);
+  int direntry_index = *offset;
+  if (direntry_index >= total_direntrys) return -1;
+
+  struct rfs_dir_cache *dir_cache = (struct rfs_dir_cache *)dir_vinode->i_fs_info;
+  struct rfs_direntry *p_direntry = dir_cache->dir_base_addr + direntry_index;
+
+  strcpy(dir->name, p_direntry->name);
+  dir->inum = p_direntry->inum;
+
+  (*offset)++;
+  return 0;
+}
+
+struct vinode *rfs_mkdir(struct vinode *parent, struct dentry *sub_dentry) {
+  struct rfs_device *rdev = rfs_device_list[parent->sb->s_dev->dev_id];
+
+  struct rfs_dinode *free_dinode = NULL;
+  int free_inum = 0;
+  for (int i = 0; i < (RFS_BLKSIZE / RFS_INODESIZE * RFS_MAX_INODE_BLKNUM); i++) {
+    free_dinode = rfs_read_dinode(rdev, i);
+    if (free_dinode->type == R_FREE) {
+      free_inum = i;
+      break;
+    }
+    free_page(free_dinode);
+  }
+
+  if (free_dinode == NULL)
+    panic( "rfs_mkdir: no more free disk inode, we cannot create directory.\n" );
+
+  free_dinode->size = 0;
+  free_dinode->type = R_DIR;
+  free_dinode->nlinks = 1;
+  free_dinode->blocks = 1;
+  free_dinode->addrs[0] = rfs_alloc_block(parent->sb);
+
+  rfs_write_dinode(rdev, free_dinode, free_inum);
+  free_page(free_dinode);
+
+  int result = rfs_add_direntry(parent, sub_dentry->name, free_inum);
+  if (result == -1) {
+    return NULL;
+  }
+
+  struct vinode *sub_vinode = rfs_alloc_vinode(parent->sb);
+  sub_vinode->inum = free_inum;
+  rfs_update_vinode(sub_vinode);
+
+  return sub_vinode;
+}
+
+struct super_block *rfs_get_superblock(struct device *dev) {
+  struct rfs_device *rdev = rfs_device_list[dev->dev_id];
+
+  if (rfs_r1block(rdev, RFS_BLK_OFFSET_SUPER) != 0)
+    panic("RFS: failed to read superblock!\n");
+
+  struct rfs_superblock d_sb;
+  memcpy(&d_sb, rdev->iobuffer, sizeof(struct rfs_superblock));
+
+  struct super_block *sb = alloc_page();
+  sb->magic = d_sb.magic;
+  sb->size = d_sb.size;
+  sb->nblocks = d_sb.nblocks;
+  sb->ninodes = d_sb.ninodes;
+  sb->s_dev = dev;
+
+  if( sb->magic != RFS_MAGIC ) 
+    panic("rfs_get_superblock: wrong ramdisk device!\n");
+
+  struct vinode *root_inode = rfs_alloc_vinode(sb);
+  root_inode->inum = 0;
+  rfs_update_vinode(root_inode);
+
+  struct dentry *root_dentry = alloc_vfs_dentry("/", root_inode, NULL);
+  sb->s_root = root_dentry;
+
+  if (rfs_r1block(rdev, RFS_BLK_OFFSET_BITMAP) != 0)
+    panic("RFS: failed to read bitmap!\n");
+  void *bitmap = alloc_page();
+  memcpy(bitmap, rdev->iobuffer, RFS_BLKSIZE);
+  sb->s_fs_info = bitmap;
+
+  return sb;
+}
+```
+
+- 用以下代码替换`process.c`
+
+```c
+#include "riscv.h"
+#include "strap.h"
+#include "config.h"
+#include "process.h"
+#include "elf.h"
+#include "string.h"
+#include "vmm.h"
+#include "pmm.h"
+#include "memlayout.h"
+#include "sched.h"
+#include "proc_file.h"
+#include "spike_interface/spike_utils.h"
+
+extern char smode_trap_vector[];
+extern void return_to_user(trapframe *, uint64 satp);
+extern char trap_sec_start[];
+
+process procs[NPROC];
+process* current = NULL;
+
+void switch_to(process* proc) {
+  assert(proc);
+  current = proc;
+
+  write_csr(stvec, (uint64)smode_trap_vector);
+
+  proc->trapframe->kernel_sp = proc->kstack;
+  proc->trapframe->kernel_satp = read_csr(satp);
+  proc->trapframe->kernel_trap = (uint64)smode_trap_handler;
+
+  unsigned long x = read_csr(sstatus);
+  x &= ~SSTATUS_SPP;
+  x |= SSTATUS_SPIE;
+
+  write_csr(sstatus, x);
+
+  write_csr(sepc, proc->trapframe->epc);
+
+  uint64 user_satp = MAKE_SATP(proc->pagetable);
+
+  return_to_user(proc->trapframe, user_satp);
+}
+
+void init_proc_pool() {
+  memset( procs, 0, sizeof(process)*NPROC );
+
+  for (int i = 0; i < NPROC; ++i) {
+    procs[i].status = FREE;
+    procs[i].pid = i;
+  }
+}
+
+process* alloc_process() {
+  int i;
+
+  for( i=0; i<NPROC; i++ )
+    if( procs[i].status == FREE ) break;
+
+  if( i>=NPROC ){
+    panic( "cannot find any free process structure.\n" );
+    return 0;
+  }
+
+  procs[i].trapframe = (trapframe *)alloc_page();
+  memset(procs[i].trapframe, 0, sizeof(trapframe));
+
+  procs[i].pagetable = (pagetable_t)alloc_page();
+  memset((void *)procs[i].pagetable, 0, PGSIZE);
+
+  procs[i].kstack = (uint64)alloc_page() + PGSIZE;
+  uint64 user_stack = (uint64)alloc_page();
+  procs[i].trapframe->regs.sp = USER_STACK_TOP;
+
+  procs[i].mapped_info = (mapped_region*)alloc_page();
+  memset( procs[i].mapped_info, 0, PGSIZE );
+
+  user_vm_map((pagetable_t)procs[i].pagetable, USER_STACK_TOP - PGSIZE, PGSIZE,
+    user_stack, prot_to_type(PROT_WRITE | PROT_READ, 1));
+  procs[i].mapped_info[STACK_SEGMENT].va = USER_STACK_TOP - PGSIZE;
+  procs[i].mapped_info[STACK_SEGMENT].npages = 1;
+  procs[i].mapped_info[STACK_SEGMENT].seg_type = STACK_SEGMENT;
+
+  user_vm_map((pagetable_t)procs[i].pagetable, (uint64)procs[i].trapframe, PGSIZE,
+    (uint64)procs[i].trapframe, prot_to_type(PROT_WRITE | PROT_READ, 0));
+  procs[i].mapped_info[CONTEXT_SEGMENT].va = (uint64)procs[i].trapframe;
+  procs[i].mapped_info[CONTEXT_SEGMENT].npages = 1;
+  procs[i].mapped_info[CONTEXT_SEGMENT].seg_type = CONTEXT_SEGMENT;
+
+  user_vm_map((pagetable_t)procs[i].pagetable, (uint64)trap_sec_start, PGSIZE,
+    (uint64)trap_sec_start, prot_to_type(PROT_READ | PROT_EXEC, 0));
+  procs[i].mapped_info[SYSTEM_SEGMENT].va = (uint64)trap_sec_start;
+  procs[i].mapped_info[SYSTEM_SEGMENT].npages = 1;
+  procs[i].mapped_info[SYSTEM_SEGMENT].seg_type = SYSTEM_SEGMENT;
+
+  sprint("in alloc_proc. user frame 0x%lx, user stack 0x%lx, user kstack 0x%lx \n",
+    procs[i].trapframe, procs[i].trapframe->regs.sp, procs[i].kstack);
+
+  procs[i].user_heap.heap_top = USER_FREE_ADDRESS_START;
+  procs[i].user_heap.heap_bottom = USER_FREE_ADDRESS_START;
+  procs[i].user_heap.free_pages_count = 0;
+
+  procs[i].mapped_info[HEAP_SEGMENT].va = USER_FREE_ADDRESS_START;
+  procs[i].mapped_info[HEAP_SEGMENT].npages = 0;
+  procs[i].mapped_info[HEAP_SEGMENT].seg_type = HEAP_SEGMENT;
+
+  procs[i].total_mapped_region = 4;
+
+  procs[i].pfiles = init_proc_file_management();
+  sprint("in alloc_proc. build proc_file_management successfully.\n");
+
+  return &procs[i];
+}
+
+int free_process( process* proc ) {
+  proc->status = ZOMBIE;
+  return 0;
+}
+
+int do_fork( process* parent)
+{
+  sprint( "will fork a child from parent %d.\n", parent->pid );
+  process* child = alloc_process();
+
+  for( int i=0; i<parent->total_mapped_region; i++ ){
+    switch( parent->mapped_info[i].seg_type ){
+      case CONTEXT_SEGMENT:
+        *child->trapframe = *parent->trapframe;
+        break;
+      case STACK_SEGMENT:
+        memcpy( (void*)lookup_pa(child->pagetable, child->mapped_info[STACK_SEGMENT].va),
+          (void*)lookup_pa(parent->pagetable, parent->mapped_info[i].va), PGSIZE );
+        break;
+      case HEAP_SEGMENT: {
+        int free_block_filter[MAX_HEAP_PAGES];
+        memset(free_block_filter, 0, MAX_HEAP_PAGES);
+        uint64 heap_bottom = parent->user_heap.heap_bottom;
+        for (int j = 0; j < parent->user_heap.free_pages_count; j++) {
+          int index = (parent->user_heap.free_pages_address[j] - heap_bottom) / PGSIZE;
+          free_block_filter[index] = 1;
+        }
+
+        for (uint64 heap_block = parent->user_heap.heap_bottom;
+             heap_block < parent->user_heap.heap_top; heap_block += PGSIZE) {
+          if (free_block_filter[(heap_block - heap_bottom) / PGSIZE])
+            continue;
+
+          void* child_pa = alloc_page();
+          memcpy(child_pa, (void*)lookup_pa(parent->pagetable, heap_block), PGSIZE);
+          user_vm_map((pagetable_t)child->pagetable, heap_block, PGSIZE, (uint64)child_pa,
+                      prot_to_type(PROT_WRITE | PROT_READ, 1));
+        }
+
+        child->mapped_info[HEAP_SEGMENT].npages = parent->mapped_info[HEAP_SEGMENT].npages;
+        memcpy((void*)&child->user_heap, (void*)&parent->user_heap, sizeof(parent->user_heap));
+        break;
+      }
+      case CODE_SEGMENT:
+        for (int j = 0; j < parent->mapped_info[i].npages; j++) {
+          uint64 va = parent->mapped_info[i].va + j * PGSIZE;
+          uint64 pa = lookup_pa(parent->pagetable, va);
+          user_vm_map(child->pagetable, va, PGSIZE, pa, prot_to_type(PROT_READ | PROT_EXEC, 1));
+        }
+        sprint("do_fork map code segment at pa:%016lx of parent to child at va:%016lx.\n",
+               lookup_pa(parent->pagetable, parent->mapped_info[i].va), parent->mapped_info[i].va);
+        child->mapped_info[child->total_mapped_region].va = parent->mapped_info[i].va;
+        child->mapped_info[child->total_mapped_region].npages =
+          parent->mapped_info[i].npages;
+        child->mapped_info[child->total_mapped_region].seg_type = CODE_SEGMENT;
+        child->total_mapped_region++;
+        break;
+      case DATA_SEGMENT:
+        for (int j = 0; j < parent->mapped_info[i].npages; j++) {
+          uint64 va = parent->mapped_info[i].va + j * PGSIZE;
+          void* pa = alloc_page();
+          memcpy(pa, (void*)lookup_pa(parent->pagetable, va), PGSIZE);
+          user_vm_map(child->pagetable, va, PGSIZE, (uint64)pa, prot_to_type(PROT_READ | PROT_WRITE, 1));
+        }
+        child->mapped_info[child->total_mapped_region].va = parent->mapped_info[i].va;
+        child->mapped_info[child->total_mapped_region].npages = parent->mapped_info[i].npages;
+        child->mapped_info[child->total_mapped_region].seg_type = DATA_SEGMENT;
+        child->total_mapped_region++;
+        break;
+    }
+  }
+
+  child->status = READY;
+  child->trapframe->regs.a0 = 0;
+  child->parent = parent;
+  insert_to_ready_queue( child );
+
+  return child->pid;
+}
 ```
 
