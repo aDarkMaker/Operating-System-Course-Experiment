@@ -1576,3 +1576,552 @@ void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free);
 ```
 
 # 通关操作
+
+- 用以下代码替换`kernel/memlayout.h`
+```c
+#ifndef _MEMLAYOUT_H
+#define _MEMLAYOUT_H
+#include "riscv.h"
+
+#define DRAM_BASE 0x80000000
+#define KERN_BASE 0x80000000
+
+#define STACK_SIZE 4096
+#define USER_STACK_TOP 0x7ffff000
+#define USER_FREE_ADDRESS_START 0x00000000 + PGSIZE * 1024
+
+#endif
+```
+
+- 用以下代码替换`kernel/strap.c`
+```c
+#include "riscv.h"
+#include "process.h"
+#include "strap.h"
+#include "syscall.h"
+
+#include "spike_interface/spike_utils.h"
+
+static void handle_syscall(trapframe *tf) {
+  tf->epc += 4;
+  tf->regs.a0 = do_syscall(tf->regs.a0, tf->regs.a1, tf->regs.a2, tf->regs.a3,
+                           tf->regs.a4, tf->regs.a5, tf->regs.a6, tf->regs.a7);
+}
+
+static uint64 g_ticks = 0;
+
+void handle_mtimer_trap() {
+  g_ticks++;
+  write_csr(sip, read_csr(sip) & ~SIP_SSIP);
+}
+
+void smode_trap_handler(void) {
+  if ((read_csr(sstatus) & SSTATUS_SPP) != 0) panic("usertrap: not from user mode");
+
+  assert(current);
+  current->trapframe->epc = read_csr(sepc);
+
+  uint64 cause = read_csr(scause);
+
+  if (cause == CAUSE_USER_ECALL) {
+    handle_syscall(current->trapframe);
+  } else if (cause == CAUSE_MTIMER_S_TRAP) {
+    handle_mtimer_trap();
+  } else {
+    sprint("smode_trap_handler(): unexpected scause %p\n", read_csr(scause));
+    sprint("            sepc=%p stval=%p\n", read_csr(sepc), read_csr(stval));
+    panic("unexpected exception happened.\n");
+  }
+
+  switch_to(current);
+}
+```
+
+- 用以下代码替换`kernel/mtrap.c`
+```c
+#include "kernel/riscv.h"
+#include "kernel/process.h"
+#include "spike_interface/spike_utils.h"
+
+static void handle_instruction_access_fault() { panic("Instruction access fault!"); }
+
+static void handle_load_access_fault() { panic("Load access fault!"); }
+
+static void handle_store_access_fault() { panic("Store/AMO access fault!"); }
+
+static void handle_illegal_instruction() { panic("Illegal instruction!"); }
+
+static void handle_misaligned_load() { panic("Misaligned Load!"); }
+
+static void handle_misaligned_store() { panic("Misaligned AMO!"); }
+
+static void handle_timer() {
+  int cpuid = 0;
+  *(uint64*)CLINT_MTIMECMP(cpuid) = *(uint64*)CLINT_MTIMECMP(cpuid) + TIMER_INTERVAL;
+  write_csr(sip, SIP_SSIP);
+}
+
+void handle_mtrap() {
+  uint64 mcause = read_csr(mcause);
+  switch (mcause) {
+    case CAUSE_MTIMER:
+      handle_timer();
+      break;
+    case CAUSE_FETCH_ACCESS:
+      handle_instruction_access_fault();
+      break;
+    case CAUSE_LOAD_ACCESS:
+      handle_load_access_fault();
+      break;
+    case CAUSE_STORE_ACCESS:
+      handle_store_access_fault();
+      break;
+    case CAUSE_ILLEGAL_INSTRUCTION:
+      handle_illegal_instruction();
+      break;
+    case CAUSE_MISALIGNED_LOAD:
+      handle_misaligned_load();
+      break;
+    case CAUSE_MISALIGNED_STORE:
+      handle_misaligned_store();
+      break;
+    default:
+      sprint("machine trap(): unexpected mscause %p\n", mcause);
+      sprint("            mepc=%p mtval=%p\n", read_csr(mepc), read_csr(mtval));
+      panic("unexpected exception happened in M-mode.\n");
+      break;
+  }
+}
+```
+
+- 用以下代码替换`kernel/vmm.c`
+
+```c
+#include "vmm.h"
+#include "riscv.h"
+#include "pmm.h"
+#include "util/types.h"
+#include "memlayout.h"
+#include "util/string.h"
+#include "spike_interface/spike_utils.h"
+#include "util/functions.h"
+#include "process.h"
+
+/* --- mem_block for sub-page allocation --- */
+typedef struct mem_block_t {
+  int start;
+  int size;
+  int end;
+} mem_block;
+
+uint64 block_num;
+mem_block block[128];
+uint64 busy_block_num;
+mem_block busy_block[128];
+
+void insert_block(mem_block new_block) {
+  for (int i = block_num; i >= 0; i--) {
+    if (i == 0) {
+      block[i] = new_block;
+      break;
+    }
+    if (block[i - 1].size >= new_block.size) block[i] = block[i - 1];
+    else block[i] = new_block;
+  }
+  block_num++;
+}
+
+void* map_and_alloc(uint64* va) {
+  void* pa = alloc_page();
+  *va = g_ufree_page;
+  g_ufree_page += PGSIZE;
+  user_vm_map((pagetable_t)current->pagetable, *va, PGSIZE, (uint64)pa,
+    prot_to_type(PROT_WRITE | PROT_READ, 1));
+  return pa;
+}
+
+/* --- utility functions for virtual address mapping --- */
+int map_pages(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+  uint64 first, last;
+  pte_t *pte;
+
+  for (first = ROUNDDOWN(va, PGSIZE), last = ROUNDDOWN(va + size - 1, PGSIZE);
+      first <= last; first += PGSIZE, pa += PGSIZE) {
+    if ((pte = page_walk(page_dir, first, 1)) == 0) return -1;
+    if (*pte & PTE_V)
+      panic("map_pages fails on mapping va (0x%lx) to pa (0x%lx)", first, pa);
+    *pte = PA2PTE(pa) | perm | PTE_V;
+  }
+  return 0;
+}
+
+uint64 prot_to_type(int prot, int user) {
+  uint64 perm = 0;
+  if (prot & PROT_READ) perm |= PTE_R | PTE_A;
+  if (prot & PROT_WRITE) perm |= PTE_W | PTE_D;
+  if (prot & PROT_EXEC) perm |= PTE_X | PTE_A;
+  if (perm == 0) perm = PTE_R;
+  if (user) perm |= PTE_U;
+  return perm;
+}
+
+pte_t *page_walk(pagetable_t page_dir, uint64 va, int alloc) {
+  if (va >= MAXVA) panic("page_walk");
+
+  pagetable_t pt = page_dir;
+
+  for (int level = 2; level > 0; level--) {
+    pte_t *pte = pt + PX(level, va);
+
+    if (*pte & PTE_V) {
+      pt = (pagetable_t)PTE2PA(*pte);
+    } else {
+      if( alloc && ((pt = (pte_t *)alloc_page(1)) != 0) ){
+        memset(pt, 0, PGSIZE);
+        *pte = PA2PTE(pt) | PTE_V;
+      } else
+        return 0;
+    }
+  }
+
+  return pt + PX(0, va);
+}
+
+uint64 lookup_pa(pagetable_t pagetable, uint64 va) {
+  pte_t *pte;
+  uint64 pa;
+
+  if (va >= MAXVA) return 0;
+
+  pte = page_walk(pagetable, va, 0);
+  if (pte == 0 || (*pte & PTE_V) == 0 || ((*pte & PTE_R) == 0 && (*pte & PTE_W) == 0))
+    return 0;
+  pa = PTE2PA(*pte);
+
+  return pa;
+}
+
+/* --- kernel page table part --- */
+extern char _etext[];
+pagetable_t g_kernel_pagetable;
+
+void kern_vm_map(pagetable_t page_dir, uint64 va, uint64 pa, uint64 sz, int perm) {
+  if (map_pages(page_dir, va, sz, pa, perm) != 0) panic("kern_vm_map");
+}
+
+void kern_vm_init(void) {
+  pagetable_t t_page_dir;
+
+  t_page_dir = (pagetable_t)alloc_page();
+  memset(t_page_dir, 0, PGSIZE);
+
+  kern_vm_map(t_page_dir, KERN_BASE, DRAM_BASE, (uint64)_etext - KERN_BASE,
+         prot_to_type(PROT_READ | PROT_EXEC, 0));
+
+  sprint("KERN_BASE 0x%lx\n", lookup_pa(t_page_dir, KERN_BASE));
+
+  kern_vm_map(t_page_dir, (uint64)_etext, (uint64)_etext, PHYS_TOP - (uint64)_etext,
+         prot_to_type(PROT_READ | PROT_WRITE, 0));
+
+  sprint("physical address of _etext is: 0x%lx\n", lookup_pa(t_page_dir, (uint64)_etext));
+
+  g_kernel_pagetable = t_page_dir;
+}
+
+/* --- user page table part --- */
+void *user_va_to_pa(pagetable_t page_dir, void *va) {
+  uint64 va_val = (uint64)va;
+  pte_t *pte = page_walk(page_dir, va_val, 0);
+  if (pte == 0) return 0;
+  if ((*pte & PTE_V) == 0) return 0;
+  if ((*pte & (PTE_R | PTE_W | PTE_X)) == 0) return 0;
+  uint64 pa = PTE2PA(*pte) + (va_val & (PGSIZE - 1));
+  return (void *)pa;
+}
+
+void user_vm_map(pagetable_t page_dir, uint64 va, uint64 size, uint64 pa, int perm) {
+  if (map_pages(page_dir, va, size, pa, perm) != 0) {
+    panic("fail to user_vm_map .\n");
+  }
+}
+
+void user_vm_unmap(pagetable_t page_dir, uint64 va, uint64 size, int free) {
+  uint64 first = ROUNDDOWN(va, PGSIZE);
+  uint64 last = ROUNDDOWN(va + size - 1, PGSIZE);
+
+  for (uint64 a = first; a <= last; a += PGSIZE) {
+    pte_t *pte = page_walk(page_dir, a, 0);
+    if (pte == 0) panic("user_vm_unmap: walk");
+    if ((*pte & PTE_V) == 0) panic("user_vm_unmap: not mapped");
+    if ((*pte & PTE_U) == 0) panic("user_vm_unmap: not user");
+
+    if (free) {
+      uint64 pa = PTE2PA(*pte);
+      free_page((void*)pa);
+    }
+
+    *pte = 0;
+  }
+}
+
+/* --- sub-page memory allocation --- */
+uint64 sys_user_allocate_page(uint64 size) {
+  uint64 va = 0;
+  if (block_num == 0) {
+    void* pa = map_and_alloc(&va);
+
+    block[0].start = va + size;
+    block[0].size = PGSIZE - size;
+    block[0].end = va + PGSIZE - 1;
+    block_num = 1;
+
+    busy_block[0].start = va;
+    busy_block[0].size = size;
+    busy_block[0].end = va + size - 1;
+    busy_block_num++;
+
+    return va;
+  }
+
+  int idx = 0;
+  for (idx = 0; idx < block_num; idx++)
+    if (block[idx].size >= size) break;
+
+  if (idx == block_num) {
+    mem_block last;
+    last.end = 0;
+
+    for (int i = 0; i < block_num; i++)
+      if (block[i].end > last.end) {
+        last = block[i];
+        for (int j = i; j < block_num; j++) 
+          block[j] = block[j + 1];
+      }
+    
+    void* pa = map_and_alloc(&va);
+    
+    last.end += PGSIZE;
+    last.size += PGSIZE;
+    insert_block(last);
+  }
+
+  for (idx = 0; idx < block_num; idx++)
+    if (block[idx].size >= size) {
+      va = block[idx].start;
+
+      mem_block new_busy;
+      new_busy.start = block[idx].start;
+      new_busy.size = size;
+      new_busy.end = block[idx].start + size - 1;
+
+      for (int i = busy_block_num; i > 0; i--) 
+        if (busy_block[i].start > new_busy.start) busy_block[i] = busy_block[i - 1];
+        else busy_block[i] = new_busy;
+      busy_block_num++;
+
+      if (block[idx].size == size) break;
+
+      mem_block new_block;
+      new_block.start = block[idx].start;
+      new_block.size = block[idx].size - size;
+      new_block.end = block[idx].end;
+
+      for (int i = idx; i < block_num - 1; i++)
+        block[i] = block[i + 1];
+      block_num--;
+
+      insert_block(new_block);
+      break;
+    }
+    
+  return va;
+}
+
+uint64 sys_user_free_page(uint64 va) {
+  int idx;
+  mem_block new_free;
+  for (idx = 0; idx < busy_block_num; idx++)
+    if (busy_block[idx].start == va) {
+      new_free = busy_block[idx];
+      insert_block(new_free);
+
+      for (int i = idx; i < busy_block_num - 1; i++) 
+        busy_block[i] = busy_block[i + 1];
+
+      break;
+    }
+
+  bool front = FALSE, back = FALSE;
+  uint64 front_idx = 0, back_idx = 0;
+  for (int i = 0; i < block_num; i++) {
+    if (new_free.start == block[i].end + 1) {
+      front = TRUE;
+      front_idx = i;
+    }
+    if (new_free.end == block[i].start - 1) {
+      back = TRUE;
+      back_idx = i;
+    }
+  }
+
+  mem_block merge;
+  if (front && !back) {
+    merge.start = block[front_idx].start;
+    merge.size = block[front_idx].size + new_free.size;
+    merge.end = new_free.end;
+    for (int i = front_idx; i < block_num - 2; i++) block[i] = block[i + 2];
+    block_num -= 2;
+  }
+  else if (!front && back) {
+    merge.start = new_free.start;
+    merge.size = new_free.size + block[back_idx].size;
+    merge.end = block[back_idx].end;
+    for (int i = back_idx - 1; i < block_num - 2; i++) block[i] = block[i + 2];
+    block_num -= 2;
+  }
+  else if (front && back) {
+    merge.start = block[front_idx].start;
+    merge.size = block[front_idx].size + new_free.size + block[back_idx].size;
+    merge.end = block[back_idx].end;
+    for (int i = front_idx; i < block_num - 2; i++) block[i] = block[i + 3];
+    block_num -= 3;
+  }
+
+  insert_block(merge);
+  return 0;
+}
+```
+
+- 用以下代码替换`kernel/syscall.c`
+```c
+/*
+ * contains the implementation of all syscalls.
+ */
+
+#include <stdint.h>
+#include <errno.h>
+
+#include "util/types.h"
+#include "syscall.h"
+#include "string.h"
+#include "process.h"
+#include "util/functions.h"
+#include "pmm.h"
+#include "vmm.h"
+#include "spike_interface/spike_utils.h"
+
+//
+// implement the SYS_user_print syscall
+//
+ssize_t sys_user_print(const char* buf, size_t n) {
+  // buf is now an address in user space of the given app\'s user stack,
+  // so we have to transfer it into phisical address (kernel is running in direct mapping).
+  assert( current );
+  char* pa = (char*)user_va_to_pa((pagetable_t)(current->pagetable), (void*)buf);
+  sprint(pa);
+  return 0;
+}
+
+//
+// implement the SYS_user_exit syscall
+//
+ssize_t sys_user_exit(uint64 code) {
+  sprint("User exit with code:%d.\n", code);
+  // in lab1, PKE considers only one app (one process). 
+  // therefore, shutdown the system when the app calls exit()
+  shutdown(code);
+}
+
+// sys_user_allocate_page and sys_user_free_page are defined in kernel/vmm.c
+extern uint64 sys_user_allocate_page(uint64 size);
+extern uint64 sys_user_free_page(uint64 va);
+
+//
+// [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
+// returns the code of success, (e.g., 0 means success, fail for otherwise)
+//
+long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
+  switch (a0) {
+    case SYS_user_print:
+      return sys_user_print((const char*)a1, a2);
+    case SYS_user_exit:
+      return sys_user_exit(a1);
+    // added @lab2_2
+    case SYS_user_allocate_page:
+      return sys_user_allocate_page(a1);
+    case SYS_user_free_page:
+      return sys_user_free_page(a1);
+    default:
+      panic("Unknown syscall %ld \n", a0);
+  }
+}
+```
+
+- 用以下代码替换`user/user_lib.c`
+```c
+/*
+ * The supporting library for applications.
+ * Actually, supporting routines for applications are catalogued as the user 
+ * library. we don\'t do that in PKE to make the relationship between application 
+ * and user library more straightforward.
+ */
+
+#include "user_lib.h"
+#include "util/types.h"
+#include "util/snprintf.h"
+#include "kernel/syscall.h"
+
+uint64 do_user_call(uint64 sysnum, uint64 a1, uint64 a2, uint64 a3, uint64 a4, uint64 a5, uint64 a6,
+                 uint64 a7) {
+  int ret;
+
+  // before invoking the syscall, arguments of do_user_call are already loaded into the argument
+  // registers (a0-a7) of our (emulated) risc-v machine.
+  asm volatile(
+      "ecall\n"
+      "sw a0, %0"  // returns a 32-bit value
+      : "=m"(ret)
+      :
+      : "memory");
+
+  return ret;
+}
+
+//
+// printu() supports user/lab1_1_helloworld.c
+//
+int printu(const char* s, ...) {
+  va_list vl;
+  va_start(vl, s);
+
+  char out[256];  // fixed buffer size.
+  int res = vsnprintf(out, sizeof(out), s, vl);
+  va_end(vl);
+  const char* buf = out;
+  size_t n = res < sizeof(out) ? res : sizeof(out);
+
+  // make a syscall to implement the required functionality.
+  return do_user_call(SYS_user_print, (uint64)buf, n, 0, 0, 0, 0, 0);
+}
+
+//
+// applications need to call exit to quit execution.
+//
+int exit(int code) {
+  return do_user_call(SYS_user_exit, code, 0, 0, 0, 0, 0, 0); 
+}
+
+//
+// lib call to better_malloc
+//
+void* better_malloc(int n) {
+  return (void*)do_user_call(SYS_user_allocate_page, n, 0, 0, 0, 0, 0, 0);
+}
+
+//
+// lib call to better_free
+//
+void better_free(void* va) {
+  do_user_call(SYS_user_free_page, (uint64)va, 0, 0, 0, 0, 0, 0);
+}
+```
