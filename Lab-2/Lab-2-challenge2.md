@@ -2032,21 +2032,15 @@ ssize_t sys_user_exit(uint64 code) {
   shutdown(code);
 }
 
-// sys_user_allocate_page and sys_user_free_page are defined in kernel/vmm.c
 extern uint64 sys_user_allocate_page(uint64 size);
 extern uint64 sys_user_free_page(uint64 va);
 
-//
-// [a0]: the syscall number; [a1] ... [a7]: arguments to the syscalls.
-// returns the code of success, (e.g., 0 means success, fail for otherwise)
-//
 long do_syscall(long a0, long a1, long a2, long a3, long a4, long a5, long a6, long a7) {
   switch (a0) {
     case SYS_user_print:
       return sys_user_print((const char*)a1, a2);
     case SYS_user_exit:
       return sys_user_exit(a1);
-    // added @lab2_2
     case SYS_user_allocate_page:
       return sys_user_allocate_page(a1);
     case SYS_user_free_page:
